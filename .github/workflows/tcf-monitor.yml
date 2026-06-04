@@ -2,7 +2,7 @@ name: TCF Edmonton Monitor
 
 on:
   schedule:
-    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+    - cron: "2/5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -87,4 +87,3 @@ jobs:
         with:
           path: .tcf-monitor-state
           key: tcf-monitor-state-${{ github.run_id }}
-
