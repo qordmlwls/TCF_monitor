@@ -42,6 +42,8 @@ DEFAULT_URL = "https://www.afedmonton.com/en/exams/tcf/"
 DEFAULT_RECIPIENT = "qordmlwls@gmail.com"
 DEFAULT_STATE_FILE = Path.home() / ".tcf-monitor" / "afedmonton-tcf-state.json"
 DEFAULT_INTERVAL_SECONDS = 180
+DEFAULT_FETCH_ATTEMPTS = 4
+DEFAULT_RETRY_DELAY_SECONDS = 10
 MIN_INTERVAL_SECONDS = 30
 USER_AGENT = (
     "TCF-Availability-Monitor/1.0 "
@@ -302,17 +304,41 @@ def parse_exam_rows(html: str) -> list[ExamRow]:
     return rows
 
 
-def fetch_page(url: str, timeout_seconds: int) -> str:
-    response = requests.get(
-        url,
-        timeout=timeout_seconds,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-    )
-    response.raise_for_status()
-    return response.text
+def fetch_page(
+    url: str,
+    timeout_seconds: int,
+    *,
+    attempts: int = DEFAULT_FETCH_ATTEMPTS,
+    retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                timeout=timeout_seconds,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = retry_delay_seconds * attempt
+            logging.warning(
+                "Fetch attempt %s/%s failed: %s. Retrying in %ss.",
+                attempt,
+                attempts,
+                exc,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError(f"Failed to fetch {url} after {attempts} attempts: {last_error}")
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -575,7 +601,12 @@ def run_once(args: argparse.Namespace) -> int:
     state_path = Path(args.state_file).expanduser()
     state = load_state(state_path)
 
-    html = fetch_page(args.url, args.timeout_seconds)
+    html = fetch_page(
+        args.url,
+        args.timeout_seconds,
+        attempts=args.fetch_attempts,
+        retry_delay_seconds=args.retry_delay_seconds,
+    )
     rows = parse_exam_rows(html)
     events, next_state = detect_events(
         rows,
@@ -688,6 +719,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         default=int(os.getenv("TCF_MONITOR_TIMEOUT_SECONDS", "20")),
+    )
+    parser.add_argument(
+        "--fetch-attempts",
+        type=int,
+        default=int(os.getenv("TCF_MONITOR_FETCH_ATTEMPTS", str(DEFAULT_FETCH_ATTEMPTS))),
+        help="Number of times to retry fetching the TCF page before failing.",
+    )
+    parser.add_argument(
+        "--retry-delay-seconds",
+        type=int,
+        default=int(
+            os.getenv("TCF_MONITOR_RETRY_DELAY_SECONDS", str(DEFAULT_RETRY_DELAY_SECONDS))
+        ),
+        help="Base retry delay. Delay increases linearly for each failed fetch attempt.",
     )
     parser.add_argument("--once", action="store_true", help="Run one check and exit.")
     parser.add_argument("--watch", action="store_true", help="Run checks forever.")
