@@ -1,0 +1,90 @@
+name: TCF Edmonton Monitor
+
+on:
+  schedule:
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "check"
+        type: choice
+        options:
+          - check
+          - dry-run
+          - test-alert
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tcf-edmonton-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      TCF_ALERT_EMAIL_TO: qordmlwls@gmail.com
+      TCF_SMTP_HOST: smtp.gmail.com
+      TCF_SMTP_PORT: "587"
+      TCF_SMTP_STARTTLS: "true"
+      TCF_SMTP_USERNAME: ${{ secrets.TCF_SMTP_USERNAME }}
+      TCF_SMTP_PASSWORD: ${{ secrets.TCF_SMTP_PASSWORD }}
+      TCF_SMTP_FROM: ${{ secrets.TCF_SMTP_USERNAME }}
+      TCF_MONITOR_STATE_FILE: .tcf-monitor-state/state.json
+
+    steps:
+      - name: Determine mode
+        id: mode
+        shell: bash
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then MODE="check"; fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Restore monitor state
+        if: steps.mode.outputs.mode == 'check'
+        uses: actions/cache/restore@v4
+        with:
+          path: .tcf-monitor-state
+          key: tcf-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            tcf-monitor-state-
+
+      - name: Run monitor
+        shell: bash
+        run: |
+          mkdir -p .tcf-monitor-state
+          if [ "${{ steps.mode.outputs.mode }}" = "test-alert" ]; then
+            python -m tools.tcf_monitor --test-alert
+          elif [ "${{ steps.mode.outputs.mode }}" = "dry-run" ]; then
+            python -m tools.tcf_monitor --once --dry-run --state-file /tmp/tcf-monitor-dry-run-state.json
+          else
+            python -m tools.tcf_monitor --once
+          fi
+
+      - name: Save monitor state
+        if: steps.mode.outputs.mode == 'check' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: .tcf-monitor-state
+          key: tcf-monitor-state-${{ github.run_id }}
+
