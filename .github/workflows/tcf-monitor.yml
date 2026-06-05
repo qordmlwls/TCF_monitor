@@ -2,7 +2,7 @@ name: TCF Edmonton Monitor
 
 on:
   schedule:
-    - cron: "2/5 * * * *"
+    - cron: "2/15 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -78,7 +78,7 @@ jobs:
           elif [ "${{ steps.mode.outputs.mode }}" = "dry-run" ]; then
             python -m tools.tcf_monitor --once --dry-run --state-file /tmp/tcf-monitor-dry-run-state.json
           else
-            python -m tools.tcf_monitor --once
+            python -m tools.tcf_monitor --once --allow-fetch-failure
           fi
 
       - name: Save monitor state

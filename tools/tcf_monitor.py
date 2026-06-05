@@ -144,6 +144,10 @@ class AlertEvent:
     row: ExamRow
 
 
+class FetchPageError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class EmailConfig:
     recipient: str
@@ -338,7 +342,7 @@ def fetch_page(
             )
             time.sleep(sleep_seconds)
 
-    raise RuntimeError(f"Failed to fetch {url} after {attempts} attempts: {last_error}")
+    raise FetchPageError(f"Failed to fetch {url} after {attempts} attempts: {last_error}")
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -734,6 +738,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         help="Base retry delay. Delay increases linearly for each failed fetch attempt.",
     )
+    parser.add_argument(
+        "--allow-fetch-failure",
+        action="store_true",
+        help="Exit successfully when the page cannot be fetched after retries.",
+    )
     parser.add_argument("--once", action="store_true", help="Run one check and exit.")
     parser.add_argument("--watch", action="store_true", help="Run checks forever.")
     parser.add_argument("--dry-run", action="store_true", help="Print alerts and do not save state.")
@@ -774,6 +783,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logging.info("Stopped.")
         return 130
+    except FetchPageError as exc:
+        if args.allow_fetch_failure:
+            logging.warning("%s", exc)
+            logging.warning("Treating fetch failure as a skipped check.")
+            return 0
+        logging.error("%s", exc)
+        return 1
     except Exception as exc:
         logging.error("%s", exc)
         return 1
