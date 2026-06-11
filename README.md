@@ -2,7 +2,8 @@
 
 This repository monitors the public Alliance Francaise Edmonton TCF schedule
 table and sends an email alert to `qordmlwls@gmail.com` when a TCF Canada row is
-newly posted or appears available.
+available or bookable. New rows that are already `SOLD OUT!` and `Closed` do
+not send email.
 
 It does not automate checkout, payment, CAPTCHA, queueing, or final registration
 submission. You should review the official page yourself before submitting
@@ -16,7 +17,7 @@ The workflow file is included at:
 .github/workflows/tcf-monitor.yml
 ```
 
-It runs every 5 minutes at non-zero minute offsets to reduce schedule delays
+It runs every 15 minutes at non-zero minute offsets to reduce schedule delays
 around the top of the hour. It also supports manual runs from the GitHub Actions
 tab.
 
@@ -131,4 +132,3 @@ python -m tools.tcf_monitor --watch --interval-seconds 180
 ```bash
 python -m unittest discover -s tests -v
 ```
-

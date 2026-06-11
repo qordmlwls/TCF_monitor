@@ -71,7 +71,7 @@ class TcfMonitorTest(unittest.TestCase):
             rows,
             {"version": 1, "seen": {}},
             checked_at="2026-06-02T00:00:00+00:00",
-            alert_new_sessions=True,
+            alert_new_sessions=False,
             alert_on_first_run=False,
         )
 
@@ -86,7 +86,7 @@ class TcfMonitorTest(unittest.TestCase):
             baseline_rows,
             {"version": 1, "seen": {}},
             checked_at="2026-06-02T00:00:00+00:00",
-            alert_new_sessions=True,
+            alert_new_sessions=False,
             alert_on_first_run=False,
         )
 
@@ -95,13 +95,44 @@ class TcfMonitorTest(unittest.TestCase):
             rows,
             state,
             checked_at="2026-06-02T00:05:00+00:00",
-            alert_new_sessions=True,
+            alert_new_sessions=False,
             alert_on_first_run=False,
         )
 
         self.assertEqual([event.kind for event in events], ["available"])
 
-    def test_new_closed_tcf_canada_session_alerts_after_baseline(self):
+    def test_new_closed_tcf_canada_session_does_not_alert_by_default(self):
+        closed_new_html = FIXTURE_HTML.replace(
+            """<td>3</td>
+        <td>$400.00</td>
+        <td><a href="/products/tcf-canada-august-10/">Register</a></td>""",
+            """<td>SOLD OUT!</td>
+        <td>$400.00</td>
+        <td>Closed</td>""",
+        )
+        baseline_rows = parse_exam_rows(
+            closed_new_html.replace("TCF Canada - August 10", "TCF Quebec - August 10")
+        )
+        _, state = detect_events(
+            baseline_rows,
+            {"version": 1, "seen": {}},
+            checked_at="2026-06-02T00:00:00+00:00",
+            alert_new_sessions=False,
+            alert_on_first_run=False,
+        )
+
+        rows = parse_exam_rows(closed_new_html)
+        events, _ = detect_events(
+            rows,
+            state,
+            checked_at="2026-06-02T00:05:00+00:00",
+            alert_new_sessions=False,
+            alert_on_first_run=False,
+        )
+
+        self.assertEqual(events, [])
+
+    def test_new_closed_tcf_canada_session_can_be_opted_in(self):
         closed_new_html = FIXTURE_HTML.replace(
             """<td>3</td>
         <td>$400.00</td>
@@ -135,4 +166,3 @@ class TcfMonitorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

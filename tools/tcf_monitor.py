@@ -616,7 +616,7 @@ def run_once(args: argparse.Namespace) -> int:
         rows,
         state,
         checked_at=checked_at,
-        alert_new_sessions=not args.no_alert_new_sessions,
+        alert_new_sessions=args.alert_new_sessions and not args.no_alert_new_sessions,
         alert_on_first_run=args.alert_on_first_run,
     )
 
@@ -752,9 +752,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Alert for all matching rows on first run instead of using them as the baseline.",
     )
     parser.add_argument(
+        "--alert-new-sessions",
+        action="store_true",
+        help="Also alert when a new TCF Canada row is posted, even if it is closed.",
+    )
+    parser.add_argument(
         "--no-alert-new-sessions",
         action="store_true",
-        help="Only alert for rows that appear available, not newly posted closed rows.",
+        help="Deprecated compatibility flag. New closed rows are ignored by default.",
     )
     parser.add_argument("--test-alert", action="store_true", help="Send a test email and exit.")
     parser.add_argument(
