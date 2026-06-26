@@ -2,7 +2,7 @@ name: TCF Edmonton Monitor
 
 on:
   schedule:
-    - cron: "2/15 * * * *"
+    - cron: "2/5 * * * *"
   workflow_dispatch:
     inputs:
       mode:

@@ -51,6 +51,7 @@ USER_AGENT = (
 )
 
 TEXT_SPACE_RE = re.compile(r"\s+")
+BOOKING_ACTION_RE = re.compile(r"\b(register|book|booking|available|open|cart|purchase)\b")
 
 
 @dataclass(frozen=True)
@@ -95,13 +96,21 @@ class ExamRow:
         return "closed" in self.bookings.lower()
 
     @property
+    def has_booking_action(self) -> bool:
+        link_text = " ".join(f"{link.text} {link.href}" for link in self.booking_links)
+        combined = f"{self.spots_left} {self.bookings} {link_text}".lower()
+        return bool(BOOKING_ACTION_RE.search(combined))
+
+    @property
     def is_available(self) -> bool:
-        if self.is_sold_out or self.is_booking_closed:
+        if self.is_sold_out:
             return False
 
-        combined = f"{self.spots_left} {self.bookings}".lower()
-        if re.search(r"\b(register|book|booking|available|open|cart|purchase)\b", combined):
+        if self.has_booking_action:
             return True
+
+        if self.is_booking_closed:
+            return False
 
         if re.search(r"\b([1-9][0-9]*)\b", self.spots_left):
             return True
@@ -199,6 +208,15 @@ class ScheduleTableParser(HTMLParser):
             attr_map = {name.lower(): value for name, value in attrs}
             self._current_link_href = attr_map.get("href") or ""
             self._current_link_parts = []
+            return
+
+        if tag in {"button", "input"}:
+            attr_map = {name.lower(): value for name, value in attrs}
+            value = attr_map.get("value") or attr_map.get("aria-label") or attr_map.get("title")
+            if value:
+                self._cell_parts.append(f" {value} ")
+                if self._current_link_parts is not None:
+                    self._current_link_parts.append(f" {value} ")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()

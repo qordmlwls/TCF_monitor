@@ -17,9 +17,9 @@ The workflow file is included at:
 .github/workflows/tcf-monitor.yml
 ```
 
-It runs every 15 minutes at non-zero minute offsets to reduce schedule delays
-around the top of the hour. It also supports manual runs from the GitHub Actions
-tab.
+It is configured to run every 5 minutes at non-zero minute offsets to reduce
+schedule delays around the top of the hour. It also supports manual runs from
+the GitHub Actions tab.
 
 ### 1. Add Repository Secrets
 
@@ -83,9 +83,10 @@ state in the workflow log and does not email or update the saved monitor state.
 After the secrets are set, the scheduled workflow will run automatically from
 the default branch. Your laptop can be off.
 
-GitHub scheduled workflows can be delayed under load, and the shortest supported
-schedule interval is 5 minutes. If this repository is private, frequent
-scheduled runs may consume GitHub Actions minutes.
+GitHub scheduled workflows are best-effort and can still be delayed or skipped
+under load, even when the cron expression is set to the shortest supported
+5-minute interval. If this repository is private, frequent scheduled runs may
+consume GitHub Actions minutes.
 
 ## Local Usage
 

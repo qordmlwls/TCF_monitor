@@ -65,6 +65,41 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertTrue(rows[1].is_available)
         self.assertEqual(rows[1].booking_links[0].href, "/products/tcf-canada-august-10/")
 
+    def test_register_link_overrides_stale_closed_text(self):
+        mixed_status_html = FIXTURE_HTML.replace(
+            """<td><a href="/products/tcf-canada-august-10/">Register</a></td>""",
+            """<td><span class="es-status es-status-closed">Closed</span> <a href="/products/tcf-canada-august-10/">Register</a></td>""",
+        )
+
+        rows = parse_exam_rows(mixed_status_html)
+
+        self.assertTrue(rows[1].is_available)
+
+    def test_register_input_button_counts_available(self):
+        input_button_html = FIXTURE_HTML.replace(
+            """<td><a href="/products/tcf-canada-august-10/">Register</a></td>""",
+            """<td><form><input type="submit" value="Register"></form></td>""",
+        )
+
+        rows = parse_exam_rows(input_button_html)
+
+        self.assertEqual(rows[1].bookings, "Register")
+        self.assertTrue(rows[1].is_available)
+
+    def test_sold_out_still_suppresses_register_action(self):
+        sold_out_with_link_html = FIXTURE_HTML.replace(
+            """<td>3</td>
+        <td>$400.00</td>
+        <td><a href="/products/tcf-canada-august-10/">Register</a></td>""",
+            """<td>SOLD OUT!</td>
+        <td>$400.00</td>
+        <td><span class="es-status es-status-closed">Closed</span> <a href="/products/tcf-canada-august-10/">Register</a></td>""",
+        )
+
+        rows = parse_exam_rows(sold_out_with_link_html)
+
+        self.assertFalse(rows[1].is_available)
+
     def test_first_run_baselines_closed_rows_but_alerts_available_rows(self):
         rows = parse_exam_rows(FIXTURE_HTML)
         events, state = detect_events(
