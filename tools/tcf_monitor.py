@@ -27,7 +27,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -44,6 +44,8 @@ DEFAULT_STATE_FILE = Path.home() / ".tcf-monitor" / "afedmonton-tcf-state.json"
 DEFAULT_INTERVAL_SECONDS = 180
 DEFAULT_FETCH_ATTEMPTS = 4
 DEFAULT_RETRY_DELAY_SECONDS = 10
+DEFAULT_TABLE_PAGE_SIZE = 200
+MAX_TABLE_PAGES = 10
 MIN_INTERVAL_SECONDS = 30
 USER_AGENT = (
     "TCF-Availability-Monitor/1.0 "
@@ -51,7 +53,15 @@ USER_AGENT = (
 )
 
 TEXT_SPACE_RE = re.compile(r"\s+")
-BOOKING_ACTION_RE = re.compile(r"\b(register|book|booking|available|open|cart|purchase)\b")
+EXPLICIT_BOOKING_ACTION_RE = re.compile(
+    r"\b(register|book(?: now)?|add to cart|cart|purchase|buy)\b"
+)
+POSITIVE_BOOKING_STATUS_RE = re.compile(r"\b(available|open)\b")
+CLOSED_BOOKING_STATUS_RE = re.compile(
+    r"\b(closed|not available|unavailable|not open|registration ended|registration closed)\b"
+)
+SOLD_OUT_STATUS_RE = re.compile(r"\b(sold out|fully booked|full|no spots?)\b")
+ZERO_SPOTS_RE = re.compile(r"^0(?:\s+spots?(?:\s+left)?)?[!.]?$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -89,17 +99,23 @@ class ExamRow:
     @property
     def is_sold_out(self) -> bool:
         spots = self.spots_left.lower()
-        return "sold out" in spots or spots in {"0", "0 spots", "0 spot"}
+        combined = f"{self.spots_left} {self.bookings}".lower()
+        return bool(SOLD_OUT_STATUS_RE.search(combined) or ZERO_SPOTS_RE.fullmatch(spots))
 
     @property
     def is_booking_closed(self) -> bool:
-        return "closed" in self.bookings.lower()
+        return bool(CLOSED_BOOKING_STATUS_RE.search(self.bookings.lower()))
 
     @property
     def has_booking_action(self) -> bool:
         link_text = " ".join(f"{link.text} {link.href}" for link in self.booking_links)
         combined = f"{self.spots_left} {self.bookings} {link_text}".lower()
-        return bool(BOOKING_ACTION_RE.search(combined))
+        if EXPLICIT_BOOKING_ACTION_RE.search(combined):
+            return True
+        return bool(
+            POSITIVE_BOOKING_STATUS_RE.search(combined)
+            and not CLOSED_BOOKING_STATUS_RE.search(combined)
+        )
 
     @property
     def is_available(self) -> bool:
@@ -147,6 +163,12 @@ class ExamRow:
 
 
 @dataclass(frozen=True)
+class ParsedSchedulePage:
+    rows: tuple[ExamRow, ...]
+    show_more_href: str | None = None
+
+
+@dataclass(frozen=True)
 class AlertEvent:
     kind: str
     reason: str
@@ -154,6 +176,10 @@ class AlertEvent:
 
 
 class FetchPageError(RuntimeError):
+    pass
+
+
+class SchedulePageError(RuntimeError):
     pass
 
 
@@ -173,6 +199,7 @@ class ScheduleTableParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.rows: list[ParsedRow] = []
+        self.show_more_href: str | None = None
         self._current_row: list[Cell] | None = None
         self._cell_parts: list[str] | None = None
         self._cell_links: list[Link] | None = None
@@ -181,6 +208,12 @@ class ScheduleTableParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
+        attr_map = {name.lower(): value for name, value in attrs}
+        if tag == "a":
+            classes = (attr_map.get("class") or "").lower().split()
+            if "datashowmore" in classes and attr_map.get("href"):
+                self.show_more_href = attr_map["href"]
+
         if tag == "tr":
             self._finish_row()
             self._current_row = []
@@ -205,13 +238,11 @@ class ScheduleTableParser(HTMLParser):
             return
 
         if tag == "a":
-            attr_map = {name.lower(): value for name, value in attrs}
             self._current_link_href = attr_map.get("href") or ""
             self._current_link_parts = []
             return
 
         if tag in {"button", "input"}:
-            attr_map = {name.lower(): value for name, value in attrs}
             value = attr_map.get("value") or attr_map.get("aria-label") or attr_map.get("title")
             if value:
                 self._cell_parts.append(f" {value} ")
@@ -282,7 +313,7 @@ def clean_exam_name(value: str) -> str:
     return clean_text(value.replace("TCF  Canada", "TCF Canada"))
 
 
-def parse_exam_rows(html: str) -> list[ExamRow]:
+def parse_schedule_page(html: str) -> ParsedSchedulePage:
     parser = ScheduleTableParser()
     parser.feed(html)
     parser.close()
@@ -323,7 +354,24 @@ def parse_exam_rows(html: str) -> list[ExamRow]:
             )
         )
 
-    return rows
+    return ParsedSchedulePage(rows=tuple(rows), show_more_href=parser.show_more_href)
+
+
+def parse_exam_rows(html: str) -> list[ExamRow]:
+    return list(parse_schedule_page(html).rows)
+
+
+def build_schedule_page_url(
+    url: str,
+    *,
+    start: int = 0,
+    page_size: int = DEFAULT_TABLE_PAGE_SIZE,
+) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["s8-datatable1_rows"] = str(page_size)
+    query["s8-datatable1_start"] = str(start)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def fetch_page(
@@ -361,6 +409,86 @@ def fetch_page(
             time.sleep(sleep_seconds)
 
     raise FetchPageError(f"Failed to fetch {url} after {attempts} attempts: {last_error}")
+
+
+def fetch_schedule_rows(
+    url: str,
+    timeout_seconds: int,
+    *,
+    attempts: int = DEFAULT_FETCH_ATTEMPTS,
+    retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
+    page_size: int = DEFAULT_TABLE_PAGE_SIZE,
+) -> list[ExamRow]:
+    if page_size < 1:
+        raise ValueError("page_size must be positive.")
+
+    page_url = build_schedule_page_url(url, start=0, page_size=page_size)
+    seen_page_urls: set[str] = set()
+    row_fingerprints: dict[str, str] = {}
+    rows: list[ExamRow] = []
+    pages_fetched = 0
+
+    for page_number in range(MAX_TABLE_PAGES):
+        if page_url in seen_page_urls:
+            raise SchedulePageError(f"Schedule pagination loop detected at {page_url}.")
+        seen_page_urls.add(page_url)
+
+        html = fetch_page(
+            page_url,
+            timeout_seconds,
+            attempts=attempts,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+        page = parse_schedule_page(html)
+        pages_fetched += 1
+
+        if page_number == 0 and not page.rows:
+            raise SchedulePageError(
+                "The schedule table could not be parsed. The page may be unavailable or its "
+                "HTML structure may have changed."
+            )
+
+        for row in page.rows:
+            previous_fingerprint = row_fingerprints.get(row.key)
+            if previous_fingerprint is None:
+                row_fingerprints[row.key] = row.fingerprint
+                rows.append(row)
+            elif previous_fingerprint != row.fingerprint:
+                raise SchedulePageError(
+                    f"Conflicting duplicate schedule row detected for {row.exam!r}."
+                )
+
+        if page.show_more_href:
+            page_url = urljoin(page_url, page.show_more_href)
+            continue
+
+        if len(page.rows) >= page_size:
+            page_url = build_schedule_page_url(
+                url,
+                start=(page_number + 1) * page_size,
+                page_size=page_size,
+            )
+            continue
+
+        break
+    else:
+        raise SchedulePageError(
+            f"Schedule pagination exceeded the safety limit of {MAX_TABLE_PAGES} pages."
+        )
+
+    tcf_rows = [row for row in rows if row.is_tcf_canada]
+    if not tcf_rows:
+        raise SchedulePageError(
+            "The parsed schedule contained no TCF Canada rows. Refusing to treat this as a "
+            "successful check."
+        )
+
+    logging.info(
+        "Fetched the complete schedule across %s page(s); parsed %s total exam rows.",
+        pages_fetched,
+        len(rows),
+    )
+    return rows
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -417,9 +545,6 @@ def detect_events(
             }
             seen[row.key] = previous
 
-        was_sold_out = "sold out" in str(previous.get("spots_left", "")).lower()
-        was_closed = "closed" in str(previous.get("bookings", "")).lower()
-
         if row.is_available and not previous.get("notified_available"):
             events.append(
                 AlertEvent(
@@ -440,18 +565,9 @@ def detect_events(
                     row=row,
                 )
             )
-        elif (
-            previous.get("fingerprint") != row.fingerprint
-            and (was_sold_out and not row.is_sold_out or was_closed and not row.is_booking_closed)
-            and not previous.get("notified_available")
-        ):
-            events.append(
-                AlertEvent(
-                    kind="status_changed",
-                    reason="A TCF Canada row changed from sold out/closed to a more interesting status.",
-                    row=row,
-                )
-            )
+
+        if not row.is_available:
+            previous["notified_available"] = False
 
         previous.update(
             {
@@ -465,10 +581,12 @@ def detect_events(
                 "last_seen_at": checked_at,
             }
         )
+        previous.pop("last_missing_at", None)
 
     for key, value in seen.items():
         if key not in current_keys:
             value["last_missing_at"] = checked_at
+            value["notified_available"] = False
 
     next_state["last_checked_at"] = checked_at
     next_state["version"] = 1
@@ -623,13 +741,12 @@ def run_once(args: argparse.Namespace) -> int:
     state_path = Path(args.state_file).expanduser()
     state = load_state(state_path)
 
-    html = fetch_page(
+    rows = fetch_schedule_rows(
         args.url,
         args.timeout_seconds,
         attempts=args.fetch_attempts,
         retry_delay_seconds=args.retry_delay_seconds,
     )
-    rows = parse_exam_rows(html)
     events, next_state = detect_events(
         rows,
         state,

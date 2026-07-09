@@ -1,9 +1,9 @@
 # TCF Edmonton Monitor
 
-This repository monitors the public Alliance Francaise Edmonton TCF schedule
-table and sends an email alert to `qordmlwls@gmail.com` when a TCF Canada row is
-available or bookable. New rows that are already `SOLD OUT!` and `Closed` do
-not send email.
+This repository monitors the complete public Alliance Francaise Edmonton TCF
+schedule table, including rows behind the page's `Show More` control. It sends
+an email alert to `qordmlwls@gmail.com` when a TCF Canada row is available or
+bookable. New rows that are already `SOLD OUT!` and `Closed` do not send email.
 
 It does not automate checkout, payment, CAPTCHA, queueing, or final registration
 submission. You should review the official page yourself before submitting
@@ -17,9 +17,14 @@ The workflow file is included at:
 .github/workflows/tcf-monitor.yml
 ```
 
-It is configured to run every 5 minutes at non-zero minute offsets to reduce
-schedule delays around the top of the hour. It also supports manual runs from
-the GitHub Actions tab.
+It requests a run every 5 minutes at non-zero minute offsets to reduce schedule
+delays around the top of the hour. It also supports manual runs from the GitHub
+Actions tab.
+
+Each successful check requests up to 200 schedule rows, follows additional
+pages when the site provides them, and requires at least one TCF Canada row. A
+fetch outage, maintenance response, or incompatible page-layout change fails
+the workflow instead of appearing as a successful check.
 
 ### 1. Add Repository Secrets
 
@@ -83,10 +88,11 @@ state in the workflow log and does not email or update the saved monitor state.
 After the secrets are set, the scheduled workflow will run automatically from
 the default branch. Your laptop can be off.
 
-GitHub scheduled workflows are best-effort and can still be delayed or skipped
-under load, even when the cron expression is set to the shortest supported
-5-minute interval. If this repository is private, frequent scheduled runs may
-consume GitHub Actions minutes.
+GitHub scheduled workflows are best-effort and can be delayed or skipped under
+load, even when the cron expression is set to the shortest supported 5-minute
+interval. A green run confirms a complete, validated page check, but the absence
+of a run does not confirm continuous monitoring. Use an always-on server with
+the `--watch` command when a dependable two-to-five-minute interval is required.
 
 ## Local Usage
 

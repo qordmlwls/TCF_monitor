@@ -47,10 +47,10 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: "pip"
@@ -60,9 +60,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
       - name: Restore monitor state
         if: steps.mode.outputs.mode == 'check'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .tcf-monitor-state
           key: tcf-monitor-state-${{ github.run_id }}
@@ -78,12 +81,12 @@ jobs:
           elif [ "${{ steps.mode.outputs.mode }}" = "dry-run" ]; then
             python -m tools.tcf_monitor --once --dry-run --state-file /tmp/tcf-monitor-dry-run-state.json
           else
-            python -m tools.tcf_monitor --once --allow-fetch-failure
+            python -m tools.tcf_monitor --once
           fi
 
       - name: Save monitor state
         if: steps.mode.outputs.mode == 'check' && success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .tcf-monitor-state
           key: tcf-monitor-state-${{ github.run_id }}
