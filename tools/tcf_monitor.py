@@ -634,6 +634,17 @@ def env_bool(name: str, *, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def report_skipped_fetch(exc: FetchPageError) -> None:
+    logging.warning("%s", exc)
+    logging.warning("Treating the exhausted network fetch as a skipped check.")
+    if env_bool("GITHUB_ACTIONS", default=False):
+        print(
+            "::warning title=TCF page temporarily unavailable::"
+            "The network fetch failed after all retries. This check was skipped and the "
+            "previous monitor state was preserved."
+        )
+
+
 def validate_email_config(config: EmailConfig) -> None:
     missing = []
     if not config.host:
@@ -925,8 +936,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except FetchPageError as exc:
         if args.allow_fetch_failure:
-            logging.warning("%s", exc)
-            logging.warning("Treating fetch failure as a skipped check.")
+            report_skipped_fetch(exc)
             return 0
         logging.error("%s", exc)
         return 1

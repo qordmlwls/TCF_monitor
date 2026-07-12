@@ -22,9 +22,10 @@ delays around the top of the hour. It also supports manual runs from the GitHub
 Actions tab.
 
 Each successful check requests up to 200 schedule rows, follows additional
-pages when the site provides them, and requires at least one TCF Canada row. A
-fetch outage, maintenance response, or incompatible page-layout change fails
-the workflow instead of appearing as a successful check.
+pages when the site provides them, and requires at least one TCF Canada row. If
+the site refuses every network retry, the workflow records a warning, preserves
+the previous state, and exits successfully. Maintenance HTML, an incompatible
+page-layout change, or a code/test failure still fails the workflow.
 
 ### 1. Add Repository Secrets
 
@@ -90,9 +91,11 @@ the default branch. Your laptop can be off.
 
 GitHub scheduled workflows are best-effort and can be delayed or skipped under
 load, even when the cron expression is set to the shortest supported 5-minute
-interval. A green run confirms a complete, validated page check, but the absence
-of a run does not confirm continuous monitoring. Use an always-on server with
-the `--watch` command when a dependable two-to-five-minute interval is required.
+interval. A green run is either a complete validated check or a network outage
+recorded as a skipped check; the `Run monitor` log identifies which occurred.
+The absence of a run does not confirm continuous monitoring. Use an always-on
+server with the `--watch` command when a dependable two-to-five-minute interval
+is required.
 
 ## Local Usage
 

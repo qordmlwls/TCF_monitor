@@ -7,9 +7,11 @@ from unittest.mock import patch
 sys.path.append(str(Path(__file__).parent.parent))
 
 from tools.tcf_monitor import (
+    FetchPageError,
     SchedulePageError,
     detect_events,
     fetch_schedule_rows,
+    main,
     mark_events_sent,
     parse_exam_rows,
 )
@@ -289,6 +291,38 @@ class TcfMonitorTest(unittest.TestCase):
         )
 
         self.assertEqual([event.kind for event in events], ["new_session"])
+
+    def test_allow_fetch_failure_skips_network_outage_with_github_warning(self):
+        with (
+            patch.dict("os.environ", {"GITHUB_ACTIONS": "true"}),
+            patch(
+                "tools.tcf_monitor.run_once",
+                side_effect=FetchPageError("connection refused"),
+            ),
+            patch("builtins.print") as print_mock,
+        ):
+            exit_code = main(["--once", "--allow-fetch-failure"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(
+            any(
+                "::warning title=TCF page temporarily unavailable::" in call.args[0]
+                for call in print_mock.call_args_list
+            )
+        )
+
+    def test_allow_fetch_failure_does_not_hide_parser_failure(self):
+        with (
+            patch(
+                "tools.tcf_monitor.run_once",
+                side_effect=SchedulePageError("schedule table changed"),
+            ),
+            patch("tools.tcf_monitor.logging.error") as error_mock,
+        ):
+            exit_code = main(["--once", "--allow-fetch-failure"])
+
+        self.assertEqual(exit_code, 1)
+        error_mock.assert_called_once()
 
 
 if __name__ == "__main__":
