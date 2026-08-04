@@ -1,9 +1,20 @@
-# TCF Edmonton Monitor
+# TCF Canada Multi-City Monitor
 
-This repository monitors the complete public Alliance Francaise Edmonton TCF
-schedule table, including rows behind the page's `Show More` control. It sends
-an email alert to `qordmlwls@gmail.com` when a TCF Canada row is available or
-bookable. New rows that are already `SOLD OUT!` and `Closed` do not send email.
+This repository monitors official TCF Canada registration data for Alliance
+Francaise locations in Edmonton, Toronto, Montreal, and Ottawa. It sends an
+email alert to `qordmlwls@gmail.com` only when a session has a reliable booking
+signal. New sessions that are already sold out or closed do not send email.
+
+The sources are:
+
+- Edmonton's complete public schedule table, including `Show More` pages.
+- Toronto's official public course feed and ActiveNet registration links.
+- Montreal's official AEC examination feed and cart links.
+- Ottawa's official AEC computer and paper examination feeds and cart links.
+
+For Toronto, Montreal, and Ottawa, a positive seat count by itself is not enough
+to trigger an alert. The official registration feed must also expose an active
+booking link. Expired Toronto registration deadlines are excluded.
 
 It does not automate checkout, payment, CAPTCHA, queueing, or final registration
 submission. You should review the official page yourself before submitting
@@ -21,11 +32,11 @@ It requests a run every 5 minutes at non-zero minute offsets to reduce schedule
 delays around the top of the hour. It also supports manual runs from the GitHub
 Actions tab.
 
-Each successful check requests up to 200 schedule rows, follows additional
-pages when the site provides them, and requires at least one TCF Canada row. If
-the site refuses every network retry, the workflow records a warning, preserves
-the previous state, and exits successfully. Maintenance HTML, an incompatible
-page-layout change, or a code/test failure still fails the workflow.
+Each check validates every city independently. If one site refuses every
+network retry, the workflow records a warning, preserves that city's previous
+state, and continues checking the other cities. A malformed official feed,
+incompatible page change, or code/test failure still fails visibly instead of
+silently treating sessions as closed.
 
 ### 1. Add Repository Secrets
 
@@ -72,7 +83,7 @@ Do not put your normal Gmail password here. Use a Gmail app password.
 In GitHub:
 
 1. Go to `Actions`.
-2. Select `TCF Edmonton Monitor`.
+2. Select `TCF Canada Multi-City Monitor`.
 3. Click `Run workflow`.
 4. Choose `test-alert`.
 5. Click `Run workflow`.
@@ -119,7 +130,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run one dry check:
+Run one dry check across all four cities:
 
 ```bash
 python -m tools.tcf_monitor --once --dry-run

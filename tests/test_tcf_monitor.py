@@ -1,19 +1,26 @@
 import sys
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from tools.tcf_monitor import (
+    ExamRow,
     FetchPageError,
+    Link,
     SchedulePageError,
     detect_events,
+    extract_aec_settings,
+    fetch_all_city_rows,
     fetch_schedule_rows,
     main,
     mark_events_sent,
+    parse_aec_examinations,
     parse_exam_rows,
+    parse_toronto_courses,
 )
 
 
@@ -323,6 +330,209 @@ class TcfMonitorTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         error_mock.assert_called_once()
+
+    def test_toronto_feed_keeps_open_courses_and_ignores_expired_deadlines(self):
+        data = {
+            "items": [
+                {
+                    "id": 101,
+                    "name": "E-TCF CANADA - 4 modules",
+                    "open_spaces": 2,
+                    "price": 390,
+                    "registration_deadline": "2026-08-05T03:59:59+00:00",
+                    "campus": {"full_name": "Alliance Francaise Toronto - Oakville"},
+                    "date_patterns": [
+                        {
+                            "activity_start_date": "2026-08-20",
+                            "activity_start_time": "08:30:00",
+                            "activity_end_time": "14:30:00",
+                        }
+                    ],
+                },
+                {
+                    "id": 102,
+                    "name": "E-TCF CANADA - 4 modules",
+                    "open_spaces": 1,
+                    "registration_deadline": "2026-08-01T03:59:59+00:00",
+                    "campus": {"name": "Mississauga"},
+                },
+            ]
+        }
+
+        rows = parse_toronto_courses(
+            data,
+            checked_at=datetime.fromisoformat("2026-08-04T12:00:00+00:00"),
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].city, "Toronto")
+        self.assertEqual(rows[0].spots_left, "2")
+        self.assertTrue(rows[0].is_available)
+        self.assertIn("Activity_Search/101", rows[0].booking_links[0].href)
+
+    def test_aec_feed_distinguishes_bookable_and_full_sessions(self):
+        data = [
+            {
+                "IDEXAMINATION_TYPE": 10,
+                "examinations": [
+                    {
+                        "IDEXAMINATION": 201,
+                        "product_name": "TCF CANADA",
+                        "qty_student": 31,
+                        "max_student": 32,
+                        "examination_coloquial_date": "Thursday, September 3, 2026",
+                        "examination_date_registration_formatted": "Registration open",
+                        "examination_location": "Montreal",
+                        "price_formatted": "$390.00",
+                        "isFull": False,
+                        "mainRegisterLink": {
+                            "link": "https://example.test/addExamination/201",
+                            "cantRegisterReason": "",
+                        },
+                    },
+                    {
+                        "IDEXAMINATION": 202,
+                        "product_name": "TCF CANADA",
+                        "qty_student": 32,
+                        "max_student": 32,
+                        "examination_date": "2026-09-04",
+                        "isFull": True,
+                        "mainRegisterLink": {
+                            "link": "https://example.test/addExamination/202",
+                            "cantRegisterReason": "",
+                        },
+                    },
+                    {
+                        "IDEXAMINATION": 203,
+                        "product_name": "TCF CANADA",
+                        "qty_student": 1,
+                        "max_student": 32,
+                        "examination_date": "2026-09-05",
+                        "isFull": False,
+                        "mainRegisterLink": {
+                            "link": "",
+                            "cantRegisterReason": "Les inscriptions ne sont pas ouvertes",
+                        },
+                    },
+                ],
+            }
+        ]
+
+        rows = parse_aec_examinations(
+            data,
+            city="Montreal",
+            page_url="https://example.test/tcf",
+        )
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0].spots_left, "1")
+        self.assertTrue(rows[0].is_available)
+        self.assertEqual(rows[1].spots_left, "SOLD OUT!")
+        self.assertFalse(rows[1].is_available)
+        self.assertEqual(rows[1].booking_links, ())
+        self.assertEqual(rows[2].spots_left, "31")
+        self.assertFalse(rows[2].is_available)
+
+    def test_aec_settings_are_discovered_from_official_page(self):
+        html = """
+        <script>
+          var aec_app_url = "https://city.aec.app";
+          var aecExtranetWebAppsAPIKey = "public-page-key";
+        </script>
+        """
+
+        self.assertEqual(
+            extract_aec_settings(html),
+            ("https://city.aec.app", "public-page-key"),
+        )
+        with self.assertRaises(SchedulePageError):
+            extract_aec_settings("<html>changed</html>")
+
+    def test_city_source_ids_do_not_collide(self):
+        common = dict(
+            exam="TCF Canada",
+            schedule="2026-09-01",
+            registration_dates="Open",
+            location="Alliance Francaise",
+            spots_left="1",
+            price="$400",
+            bookings="Open",
+            booking_links=(Link("Register", "https://example.test/register"),),
+            source_id="examination:123",
+        )
+
+        montreal = ExamRow(city="Montreal", **common)
+        ottawa = ExamRow(city="Ottawa", **common)
+
+        self.assertNotEqual(montreal.key, ottawa.key)
+
+    def test_failed_city_state_is_not_marked_missing(self):
+        toronto = ExamRow(
+            exam="TCF Canada",
+            schedule="2026-09-01",
+            registration_dates="Open",
+            location="Toronto",
+            spots_left="1",
+            price="$400",
+            bookings="Open",
+            city="Toronto",
+            source_id="course:1",
+        )
+        montreal = ExamRow(
+            exam="TCF Canada",
+            schedule="2026-09-02",
+            registration_dates="Open",
+            location="Montreal",
+            spots_left="1",
+            price="$400",
+            bookings="Open",
+            city="Montreal",
+            source_id="examination:2",
+        )
+        initial_events, state = detect_events(
+            [toronto, montreal],
+            {"version": 2, "seen": {}},
+            checked_at="2026-08-04T00:00:00+00:00",
+            alert_new_sessions=False,
+            alert_on_first_run=False,
+            active_cities={"Toronto", "Montreal"},
+        )
+        mark_events_sent(state, initial_events, "2026-08-04T00:00:00+00:00")
+
+        _, next_state = detect_events(
+            [toronto],
+            state,
+            checked_at="2026-08-04T00:05:00+00:00",
+            alert_new_sessions=False,
+            alert_on_first_run=False,
+            active_cities={"Toronto"},
+        )
+
+        self.assertNotIn("last_missing_at", next_state["seen"][montreal.key])
+        self.assertTrue(next_state["seen"][montreal.key]["notified_available"])
+
+    def test_multi_city_fetch_continues_after_one_network_failure(self):
+        edmonton_row = parse_exam_rows(FIXTURE_HTML)[0]
+        with (
+            patch("tools.tcf_monitor.fetch_schedule_rows", return_value=[edmonton_row]),
+            patch(
+                "tools.tcf_monitor.fetch_toronto_rows",
+                side_effect=FetchPageError("Toronto unavailable"),
+            ),
+            patch("tools.tcf_monitor.fetch_aec_rows", side_effect=[[], []]),
+            patch("tools.tcf_monitor.report_skipped_fetch") as report_mock,
+        ):
+            result = fetch_all_city_rows(
+                "https://www.afedmonton.com/en/exams/tcf/",
+                20,
+                attempts=1,
+                retry_delay_seconds=0,
+                checked_at=datetime.fromisoformat("2026-08-04T12:00:00+00:00"),
+            )
+
+        self.assertEqual(result.successful_cities, ("Edmonton", "Montreal", "Ottawa"))
+        self.assertEqual([failure.city for failure in result.skipped_failures], ["Toronto"])
+        report_mock.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-name: TCF Edmonton Monitor
+name: TCF Canada Multi-City Monitor
 
 on:
   schedule:
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tcf-edmonton-monitor
+  group: tcf-canada-multi-city-monitor
   cancel-in-progress: false
 
 jobs:
