@@ -18,7 +18,7 @@ import smtplib
 import ssl
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import unescape
@@ -42,6 +42,7 @@ TORONTO_PAGE_URL = (
     "informations-about-tcf-canada/tcf-canada"
 )
 TORONTO_API_URL = "https://cm-api.alliance-francaise.ca/groupcourses"
+TORONTO_ACTIVENET_URL = "https://anc.ca.apm.activecommunities.com/aftoronto"
 MONTREAL_PAGE_URL = "https://www.afmontreal.ca/en/tcf-2/"
 OTTAWA_PAGE_URL = "https://af.ca/ottawa/en/tests_et_examens/tcf/"
 DEFAULT_RECIPIENT = "qordmlwls@gmail.com"
@@ -67,6 +68,7 @@ CLOSED_BOOKING_STATUS_RE = re.compile(
 )
 SOLD_OUT_STATUS_RE = re.compile(r"\b(sold out|fully booked|full|no spots?)\b")
 ZERO_SPOTS_RE = re.compile(r"^0(?:\s+spots?(?:\s+left)?)?[!.]?$", re.IGNORECASE)
+ACTIVENET_ENROLL_ACTION_RE = re.compile(r"/activity/(?:search/)?enroll", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -635,7 +637,11 @@ def parse_toronto_courses(data: Any, *, checked_at: datetime) -> list[ExamRow]:
 
         course_id = course.get("id")
         open_spaces = course.get("open_spaces")
-        if course_id is None or not isinstance(open_spaces, (int, float)):
+        if (
+            not isinstance(course_id, int)
+            or isinstance(course_id, bool)
+            or not isinstance(open_spaces, (int, float))
+        ):
             raise SchedulePageError("Toronto course item is missing id or open_spaces.")
 
         deadline = clean_text(str(course.get("registration_deadline") or ""))
@@ -699,7 +705,72 @@ def fetch_toronto_rows(
             "Referer": TORONTO_PAGE_URL,
         },
     )
-    return parse_toronto_courses(data, checked_at=checked_at)
+    candidates = parse_toronto_courses(data, checked_at=checked_at)
+    verified: list[ExamRow] = []
+    for row in candidates:
+        course_id = row.source_id.removeprefix("course:")
+        status_data = fetch_json(
+            f"{TORONTO_ACTIVENET_URL}/rest/activity/detail/buttonstatus/{course_id}?",
+            timeout_seconds,
+            attempts=attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            headers={
+                "Referer": (
+                    f"{TORONTO_ACTIVENET_URL}/activity/search/detail/{course_id}"
+                    "?onlineSiteId=0&from_original_cui=true"
+                ),
+            },
+        )
+        is_available, notification = parse_activenet_button_status(
+            status_data, course_id=course_id
+        )
+        if not is_available:
+            logging.info(
+                "Toronto course %s rejected by final ActiveNet status: %s",
+                course_id,
+                notification or "no enrollment action",
+            )
+            continue
+
+        verified.append(
+            replace(
+                row,
+                spots_left="Available",
+                bookings="Open on ActiveNet",
+                available_override=True,
+            )
+        )
+
+    logging.info(
+        "Toronto final verification accepted %s of %s candidate course(s).",
+        len(verified),
+        len(candidates),
+    )
+    return verified
+
+
+def parse_activenet_button_status(data: Any, *, course_id: str) -> tuple[bool, str]:
+    if not isinstance(data, dict):
+        raise SchedulePageError(
+            f"Toronto ActiveNet status for course {course_id} was not an object."
+        )
+    headers = data.get("headers")
+    if not isinstance(headers, dict) or headers.get("response_code") != "0000":
+        raise SchedulePageError(
+            f"Toronto ActiveNet status for course {course_id} was not successful."
+        )
+    body = data.get("body")
+    status = body.get("button_status") if isinstance(body, dict) else None
+    if not isinstance(status, dict):
+        raise SchedulePageError(
+            f"Toronto ActiveNet status for course {course_id} had no button_status."
+        )
+
+    action = status.get("action_link")
+    action = action if isinstance(action, dict) else {}
+    action_href = clean_text(str(action.get("href") or ""))
+    notification = clean_text(str(status.get("notification") or ""))
+    return bool(ACTIVENET_ENROLL_ACTION_RE.search(action_href)), notification
 
 
 def extract_aec_settings(html: str) -> tuple[str, str]:

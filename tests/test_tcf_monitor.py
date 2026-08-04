@@ -22,8 +22,10 @@ from tools.tcf_monitor import (
     main,
     mark_events_sent,
     parse_aec_examinations,
+    parse_activenet_button_status,
     parse_exam_rows,
     parse_toronto_courses,
+    fetch_toronto_rows,
 )
 
 
@@ -372,6 +374,108 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertEqual(rows[0].spots_left, "2")
         self.assertTrue(rows[0].is_available)
         self.assertIn("Activity_Search/101", rows[0].booking_links[0].href)
+
+    def test_activenet_requires_a_real_enrollment_action(self):
+        available = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "button_status": {
+                    "action_link": {
+                        "href": "/aftoronto/activity/search/enroll/101",
+                    },
+                    "notification": "",
+                }
+            },
+        }
+        full = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "button_status": {
+                    "action_link": None,
+                    "notification": "We're sorry, but this Course is full.",
+                }
+            },
+        }
+        on_hold = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "button_status": {
+                    "action_link": {"href": ""},
+                    "notification": "This course is on hold to further registration.",
+                }
+            },
+        }
+
+        self.assertEqual(
+            parse_activenet_button_status(available, course_id="101"),
+            (True, ""),
+        )
+        self.assertEqual(
+            parse_activenet_button_status(full, course_id="101"),
+            (False, "We're sorry, but this Course is full."),
+        )
+        self.assertEqual(
+            parse_activenet_button_status(on_hold, course_id="101"),
+            (False, "This course is on hold to further registration."),
+        )
+
+    def test_toronto_fetch_rejects_stale_open_space_candidates(self):
+        courses = {
+            "items": [
+                {
+                    "id": 101,
+                    "name": "E-TCF CANADA - 4 modules",
+                    "open_spaces": 1,
+                    "price": 390,
+                    "campus": {"name": "North York"},
+                    "start_date": "2026-08-18T00:00:00+00:00",
+                },
+                {
+                    "id": 102,
+                    "name": "E-TCF CANADA - 4 modules",
+                    "open_spaces": 2,
+                    "price": 390,
+                    "campus": {"name": "Oakville"},
+                    "start_date": "2026-08-20T00:00:00+00:00",
+                },
+            ]
+        }
+        full_status = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "button_status": {
+                    "action_link": None,
+                    "notification": "Course is full.",
+                }
+            },
+        }
+        available_status = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "button_status": {
+                    "action_link": {
+                        "href": "/aftoronto/activity/search/enroll/102",
+                    },
+                    "notification": "",
+                }
+            },
+        }
+
+        with patch(
+            "tools.tcf_monitor.fetch_json",
+            side_effect=[courses, full_status, available_status],
+        ) as fetch_mock:
+            rows = fetch_toronto_rows(
+                20,
+                attempts=1,
+                retry_delay_seconds=0,
+                checked_at=datetime.fromisoformat("2026-08-04T12:00:00+00:00"),
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].source_id, "course:102")
+        self.assertEqual(rows[0].spots_left, "Available")
+        self.assertEqual(fetch_mock.call_count, 3)
 
     def test_aec_feed_distinguishes_bookable_and_full_sessions(self):
         data = [

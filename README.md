@@ -8,13 +8,17 @@ signal. New sessions that are already sold out or closed do not send email.
 The sources are:
 
 - Edmonton's complete public schedule table, including `Show More` pages.
-- Toronto's official public course feed and ActiveNet registration links.
+- Toronto's official public course feed, verified against ActiveNet's final
+  enrollment-button status for every candidate.
 - Montreal's official AEC examination feed and cart links.
 - Ottawa's official AEC computer and paper examination feeds and cart links.
 
 For Toronto, Montreal, and Ottawa, a positive seat count by itself is not enough
-to trigger an alert. The official registration feed must also expose an active
-booking link. Expired Toronto registration deadlines are excluded.
+to trigger an alert. The final registration system must expose an active booking
+link. Toronto's course feed is treated only as a candidate list because its
+`open_spaces` values can remain stale after ActiveNet is full or on hold. Every
+Toronto candidate must have a live ActiveNet enrollment action before it can
+send email. Expired Toronto registration deadlines are also excluded.
 
 It does not automate checkout, payment, CAPTCHA, queueing, or final registration
 submission. You should review the official page yourself before submitting
