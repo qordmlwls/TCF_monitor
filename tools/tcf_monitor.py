@@ -459,26 +459,46 @@ def fetch_json(
     *,
     attempts: int = DEFAULT_FETCH_ATTEMPTS,
     retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
+    headers: dict[str, str] | None = None,
 ) -> Any:
     display_url = redact_url(url)
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
+            request_headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            }
+            request_headers.update(headers or {})
             response = requests.get(
                 url,
                 timeout=timeout_seconds,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/json",
-                },
+                headers=request_headers,
             )
             response.raise_for_status()
             try:
                 return response.json()
             except requests.exceptions.JSONDecodeError as exc:
-                raise SchedulePageError(f"Invalid JSON returned by {display_url}: {exc}") from exc
-        except SchedulePageError:
-            raise
+                last_error = RuntimeError(
+                    "non-JSON response "
+                    f"(status={response.status_code}, "
+                    f"content-type={response.headers.get('Content-Type', 'unknown')!r}, "
+                    f"bytes={len(response.content)}): {exc}"
+                )
+                if attempt >= attempts:
+                    break
+                sleep_seconds = retry_delay_seconds * attempt
+                logging.warning(
+                    "JSON fetch attempt %s/%s returned unusable content for %s: %s. "
+                    "Retrying in %ss.",
+                    attempt,
+                    attempts,
+                    display_url,
+                    last_error,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
         except requests.RequestException as exc:
             last_error = exc
             if attempt >= attempts:
@@ -674,6 +694,10 @@ def fetch_toronto_rows(
         timeout_seconds,
         attempts=attempts,
         retry_delay_seconds=retry_delay_seconds,
+        headers={
+            "Origin": "https://www.alliance-francaise.ca",
+            "Referer": TORONTO_PAGE_URL,
+        },
     )
     return parse_toronto_courses(data, checked_at=checked_at)
 

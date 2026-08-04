@@ -3,7 +3,9 @@ import unittest
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import requests
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -15,6 +17,7 @@ from tools.tcf_monitor import (
     detect_events,
     extract_aec_settings,
     fetch_all_city_rows,
+    fetch_json,
     fetch_schedule_rows,
     main,
     mark_events_sent,
@@ -533,6 +536,31 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertEqual(result.successful_cities, ("Edmonton", "Montreal", "Ottawa"))
         self.assertEqual([failure.city for failure in result.skipped_failures], ["Toronto"])
         report_mock.assert_called_once()
+
+    def test_non_json_api_response_retries_then_becomes_fetch_failure(self):
+        response = Mock()
+        response.status_code = 200
+        response.headers = {"Content-Type": "text/plain"}
+        response.content = b""
+        response.raise_for_status.return_value = None
+        response.json.side_effect = requests.exceptions.JSONDecodeError(
+            "Expecting value", "", 0
+        )
+
+        with (
+            patch("tools.tcf_monitor.requests.get", return_value=response) as get_mock,
+            patch("tools.tcf_monitor.time.sleep"),
+        ):
+            with self.assertRaises(FetchPageError) as context:
+                fetch_json(
+                    "https://example.test/feed",
+                    20,
+                    attempts=2,
+                    retry_delay_seconds=0,
+                )
+
+        self.assertEqual(get_mock.call_count, 2)
+        self.assertIn("non-JSON response", str(context.exception))
 
 
 if __name__ == "__main__":
