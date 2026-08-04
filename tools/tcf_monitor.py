@@ -18,7 +18,7 @@ import smtplib
 import ssl
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import unescape
@@ -41,10 +41,19 @@ TORONTO_PAGE_URL = (
     "https://www.alliance-francaise.ca/en/exams/tests/"
     "informations-about-tcf-canada/tcf-canada"
 )
-TORONTO_API_URL = "https://cm-api.alliance-francaise.ca/groupcourses"
 TORONTO_ACTIVENET_URL = "https://anc.ca.apm.activecommunities.com/aftoronto"
 MONTREAL_PAGE_URL = "https://www.afmontreal.ca/en/tcf-2/"
 OTTAWA_PAGE_URL = "https://af.ca/ottawa/en/tests_et_examens/tcf/"
+MONTREAL_AEC_SETTINGS_URL = (
+    "https://afmontreal.extranet-aec.com/examinations/"
+    "examination_type_detail?examinationTypeId=10"
+)
+MONTREAL_AEC_API_URL = "https://afmontreal.aec.app"
+OTTAWA_AEC_SETTINGS_URL = (
+    "https://afottawa.extranet-aec.com/examinations/"
+    "examination_type_detail?examinationTypeId=5"
+)
+OTTAWA_AEC_API_URL = "https://afottawa.aec.app"
 DEFAULT_RECIPIENT = "qordmlwls@gmail.com"
 DEFAULT_STATE_FILE = Path.home() / ".tcf-monitor" / "afedmonton-tcf-state.json"
 DEFAULT_INTERVAL_SECONDS = 180
@@ -69,6 +78,7 @@ CLOSED_BOOKING_STATUS_RE = re.compile(
 SOLD_OUT_STATUS_RE = re.compile(r"\b(sold out|fully booked|full|no spots?)\b")
 ZERO_SPOTS_RE = re.compile(r"^0(?:\s+spots?(?:\s+left)?)?[!.]?$", re.IGNORECASE)
 ACTIVENET_ENROLL_ACTION_RE = re.compile(r"/activity/(?:search/)?enroll", re.IGNORECASE)
+TORONTO_EXAM_NAME = "e-tcf canada - 4 modules"
 
 
 @dataclass(frozen=True)
@@ -462,6 +472,7 @@ def fetch_json(
     attempts: int = DEFAULT_FETCH_ATTEMPTS,
     retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
     headers: dict[str, str] | None = None,
+    json_body: dict[str, Any] | None = None,
 ) -> Any:
     display_url = redact_url(url)
     last_error: Exception | None = None
@@ -472,11 +483,14 @@ def fetch_json(
                 "Accept": "application/json",
             }
             request_headers.update(headers or {})
-            response = requests.get(
-                url,
-                timeout=timeout_seconds,
-                headers=request_headers,
-            )
+            request = requests.post if json_body is not None else requests.get
+            request_options: dict[str, Any] = {
+                "timeout": timeout_seconds,
+                "headers": request_headers,
+            }
+            if json_body is not None:
+                request_options["json"] = json_body
+            response = request(url, **request_options)
             response.raise_for_status()
             try:
                 return response.json()
@@ -601,81 +615,267 @@ def fetch_schedule_rows(
     return rows
 
 
-def parse_iso_datetime(value: str, *, field_name: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise SchedulePageError(f"Invalid {field_name} timestamp: {value!r}.") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+def parse_activenet_search_page(data: Any) -> tuple[list[dict[str, Any]], int]:
+    if not isinstance(data, dict):
+        raise SchedulePageError("Toronto ActiveNet search response was not an object.")
+    headers = data.get("headers")
+    if not isinstance(headers, dict) or headers.get("response_code") != "0000":
+        raise SchedulePageError("Toronto ActiveNet search was not successful.")
+    page_info = headers.get("page_info")
+    total_pages = page_info.get("total_page") if isinstance(page_info, dict) else None
+    total_records = page_info.get("total_records") if isinstance(page_info, dict) else None
+    records_per_page = (
+        page_info.get("total_records_per_page") if isinstance(page_info, dict) else None
+    )
+    page_number = page_info.get("page_number") if isinstance(page_info, dict) else None
+    if (
+        not isinstance(total_pages, int)
+        or total_pages < 1
+        or total_pages > MAX_TABLE_PAGES
+        or not isinstance(total_records, int)
+        or total_records < 0
+        or not isinstance(records_per_page, int)
+        or records_per_page < 1
+        or not isinstance(page_number, int)
+        or page_number < 1
+    ):
+        raise SchedulePageError("Toronto ActiveNet search returned invalid pagination.")
 
+    body = data.get("body")
+    items = body.get("activity_items") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise SchedulePageError("Toronto ActiveNet search contained no activity list.")
+    expected_items = min(
+        records_per_page,
+        max(0, total_records - ((page_number - 1) * records_per_page)),
+    )
+    if len(items) != expected_items:
+        raise FetchPageError(
+            "Toronto ActiveNet returned an incomplete search page "
+            f"({len(items)} of {expected_items} reported activities)."
+        )
 
-def format_toronto_schedule(course: dict[str, Any]) -> str:
-    patterns = course.get("date_patterns")
-    if isinstance(patterns, list) and patterns and isinstance(patterns[0], dict):
-        pattern = patterns[0]
-        date = clean_text(str(pattern.get("activity_start_date") or ""))
-        start = clean_text(str(pattern.get("activity_start_time") or ""))
-        end = clean_text(str(pattern.get("activity_end_time") or ""))
-        schedule = " ".join(value for value in (date, start) if value)
-        if end:
-            schedule = f"{schedule} - {end}" if schedule else end
-        if schedule:
-            return schedule
-    return clean_text(str(course.get("start_date") or course.get("end_date") or ""))
-
-
-def parse_toronto_courses(data: Any, *, checked_at: datetime) -> list[ExamRow]:
-    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        raise SchedulePageError("Toronto course feed did not contain an items list.")
-
-    rows: list[ExamRow] = []
-    for course in data["items"]:
-        if not isinstance(course, dict):
-            raise SchedulePageError("Toronto course feed contained a malformed item.")
-
-        course_id = course.get("id")
-        open_spaces = course.get("open_spaces")
+    candidates: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise SchedulePageError("Toronto ActiveNet search contained a malformed activity.")
+        if clean_text(str(item.get("name") or "")).lower() != TORONTO_EXAM_NAME:
+            continue
+        course_id = item.get("id")
+        sub_count = item.get("num_of_sub_activities")
         if (
             not isinstance(course_id, int)
             or isinstance(course_id, bool)
-            or not isinstance(open_spaces, (int, float))
+            or not isinstance(sub_count, int)
+            or isinstance(sub_count, bool)
+            or sub_count < 0
         ):
-            raise SchedulePageError("Toronto course item is missing id or open_spaces.")
-
-        deadline = clean_text(str(course.get("registration_deadline") or ""))
-        if deadline and parse_iso_datetime(deadline, field_name="registration_deadline") <= checked_at:
-            continue
-        if open_spaces <= 0:
-            continue
-
-        campus = course.get("campus") if isinstance(course.get("campus"), dict) else {}
-        location = clean_text(
-            str(campus.get("full_name") or campus.get("name") or "Alliance Francaise Toronto")
-        )
-        price_value = course.get("price")
-        price = f"${price_value:.2f}" if isinstance(price_value, (int, float)) else clean_text(
-            str(price_value or "")
-        )
-        booking_url = f"https://ca.apm.activecommunities.com/aftoronto/Activity_Search/{course_id}"
-        rows.append(
-            ExamRow(
-                exam=clean_exam_name(str(course.get("name") or "TCF Canada")),
-                schedule=format_toronto_schedule(course),
-                registration_dates=f"Open until {deadline}" if deadline else "Open now",
-                location=location,
-                spots_left=str(int(open_spaces) if float(open_spaces).is_integer() else open_spaces),
-                price=price,
-                bookings="Open",
-                booking_links=(Link(text="Register", href=booking_url),),
-                city="Toronto",
-                page_url=TORONTO_PAGE_URL,
-                source_id=f"course:{course_id}",
-                available_override=True,
+            raise SchedulePageError(
+                "Toronto ActiveNet exam activity is missing its id or sub-course count."
             )
+        candidates.append(item)
+    return candidates, total_pages
+
+
+def fetch_activenet_search_page(
+    url: str,
+    timeout_seconds: int,
+    *,
+    attempts: int,
+    retry_delay_seconds: int,
+    headers: dict[str, str],
+    json_body: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    last_error: FetchPageError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            data = fetch_json(
+                url,
+                timeout_seconds,
+                attempts=1,
+                retry_delay_seconds=retry_delay_seconds,
+                headers=headers,
+                json_body=json_body,
+            )
+            return parse_activenet_search_page(data)
+        except FetchPageError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = retry_delay_seconds * attempt
+            logging.warning(
+                "Toronto ActiveNet search attempt %s/%s returned incomplete data: %s "
+                "Retrying in %ss.",
+                attempt,
+                attempts,
+                exc,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    raise FetchPageError(
+        f"Toronto ActiveNet search remained incomplete after {attempts} attempts: "
+        f"{last_error}"
+    )
+
+
+def parse_activenet_subactivities(
+    data: Any, *, parent_id: int, expected_count: int
+) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        raise SchedulePageError(
+            f"Toronto ActiveNet sub-courses for {parent_id} were not an object."
         )
-    return rows
+    headers = data.get("headers")
+    if not isinstance(headers, dict) or headers.get("response_code") != "0000":
+        raise SchedulePageError(
+            f"Toronto ActiveNet sub-course search for {parent_id} was not successful."
+        )
+    body = data.get("body")
+    items = body.get("sub_activities") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise SchedulePageError(
+            f"Toronto ActiveNet parent course {parent_id} had no sub-course list."
+        )
+    if len(items) != expected_count:
+        raise FetchPageError(
+            f"Toronto ActiveNet parent course {parent_id} returned "
+            f"{len(items)} of {expected_count} reported sub-courses."
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise SchedulePageError(
+                f"Toronto ActiveNet parent course {parent_id} had a malformed sub-course."
+            )
+        if clean_text(str(item.get("name") or "")).lower() != TORONTO_EXAM_NAME:
+            continue
+        course_id = item.get("id")
+        if not isinstance(course_id, int) or isinstance(course_id, bool):
+            raise SchedulePageError(
+                f"Toronto ActiveNet parent course {parent_id} had a sub-course without an id."
+            )
+        candidates.append(item)
+    if not candidates:
+        raise SchedulePageError(
+            f"Toronto ActiveNet parent course {parent_id} had no TCF Canada sub-courses."
+        )
+    return candidates
+
+
+def fetch_activenet_subactivities(
+    url: str,
+    timeout_seconds: int,
+    *,
+    attempts: int,
+    retry_delay_seconds: int,
+    headers: dict[str, str],
+    parent_id: int,
+    expected_count: int,
+) -> list[dict[str, Any]]:
+    last_error: FetchPageError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            data = fetch_json(
+                url,
+                timeout_seconds,
+                attempts=1,
+                retry_delay_seconds=retry_delay_seconds,
+                headers=headers,
+                json_body={},
+            )
+            return parse_activenet_subactivities(
+                data,
+                parent_id=parent_id,
+                expected_count=expected_count,
+            )
+        except FetchPageError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = retry_delay_seconds * attempt
+            logging.warning(
+                "Toronto ActiveNet sub-course attempt %s/%s failed or returned "
+                "incomplete data for parent %s: %s Retrying in %ss.",
+                attempt,
+                attempts,
+                parent_id,
+                exc,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    raise FetchPageError(
+        f"Toronto ActiveNet sub-courses for parent {parent_id} remained unavailable "
+        f"after {attempts} attempts: {last_error}"
+    )
+
+
+def parse_activenet_detail(
+    data: Any,
+    *,
+    candidate: dict[str, Any],
+    action_href: str,
+) -> ExamRow:
+    course_id = candidate["id"]
+    if not isinstance(data, dict):
+        raise SchedulePageError(
+            f"Toronto ActiveNet detail for course {course_id} was not an object."
+        )
+    headers = data.get("headers")
+    body = data.get("body")
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if (
+        not isinstance(headers, dict)
+        or headers.get("response_code") != "0000"
+        or not isinstance(detail, dict)
+        or detail.get("activity_id") != course_id
+    ):
+        raise SchedulePageError(
+            f"Toronto ActiveNet detail for course {course_id} was not successful."
+        )
+    exam_name = clean_exam_name(str(detail.get("activity_name") or ""))
+    if exam_name.lower() != TORONTO_EXAM_NAME:
+        raise SchedulePageError(
+            f"Toronto ActiveNet detail for course {course_id} was not a TCF Canada exam."
+        )
+
+    first_date = clean_text(str(detail.get("first_date") or ""))
+    last_date = clean_text(str(detail.get("last_date") or ""))
+    schedule = first_date
+    if last_date and last_date != first_date:
+        schedule = f"{first_date} - {last_date}" if first_date else last_date
+    if not schedule:
+        schedule = clean_text(
+            str(candidate.get("date_range") or candidate.get("number") or "")
+        )
+
+    location_data = candidate.get("location")
+    location_data = location_data if isinstance(location_data, dict) else {}
+    fee_data = candidate.get("fee")
+    fee_data = fee_data if isinstance(fee_data, dict) else {}
+    booking_url = urljoin(f"{TORONTO_ACTIVENET_URL}/", action_href)
+    return ExamRow(
+        exam=exam_name,
+        schedule=schedule,
+        registration_dates="Open now; final enrollment action verified",
+        location=clean_text(
+            str(
+                detail.get("location_description")
+                or location_data.get("label")
+                or "Alliance Francaise Toronto"
+            )
+        ),
+        spots_left=clean_text(str(detail.get("space_status") or "Available")),
+        price=clean_text(str(fee_data.get("label") or "")),
+        bookings="Open on ActiveNet",
+        booking_links=(Link(text="Register", href=booking_url),),
+        city="Toronto",
+        page_url=TORONTO_PAGE_URL,
+        source_id=f"course:{course_id}",
+        available_override=True,
+    )
 
 
 def fetch_toronto_rows(
@@ -685,30 +885,74 @@ def fetch_toronto_rows(
     retry_delay_seconds: int,
     checked_at: datetime,
 ) -> list[ExamRow]:
-    query = urlencode(
-        {
-            "enddate": "gte",
-            "status": "0",
-            "openspaces": "1",
-            "limit": "300",
-            "othercategory": "367",
-            "orderby": "course.startDate",
-        }
-    )
-    data = fetch_json(
-        f"{TORONTO_API_URL}?{query}",
-        timeout_seconds,
-        attempts=attempts,
-        retry_delay_seconds=retry_delay_seconds,
-        headers={
-            "Origin": "https://www.alliance-francaise.ca",
-            "Referer": TORONTO_PAGE_URL,
-        },
-    )
-    candidates = parse_toronto_courses(data, checked_at=checked_at)
+    del checked_at  # ActiveNet's search already limits results to current and future courses.
+    request_headers = {
+        "Origin": "https://anc.ca.apm.activecommunities.com",
+        "Referer": (
+            f"{TORONTO_ACTIVENET_URL}/activity/search?onlineSiteId=0&"
+            "activity_select_param=2&activity_keyword=TCF&viewMode=list"
+        ),
+    }
+    search_url = f"{TORONTO_ACTIVENET_URL}/rest/activities/list"
+    parent_candidates: list[dict[str, Any]] = []
+    expected_pages: int | None = None
+    for page_number in range(1, MAX_TABLE_PAGES + 1):
+        page_candidates, total_pages = fetch_activenet_search_page(
+            search_url,
+            timeout_seconds,
+            attempts=attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            headers=request_headers,
+            json_body={
+                "activity_search_pattern": {
+                    "activity_keyword": "TCF",
+                    "activity_select_param": "2",
+                },
+                "activity_transfer_pattern": {},
+                "page_info": {
+                    "page_number": page_number,
+                    "total_records_per_page": 20,
+                    "order_by": "Name",
+                },
+            },
+        )
+        if expected_pages is None:
+            expected_pages = total_pages
+        elif total_pages != expected_pages:
+            raise SchedulePageError("Toronto ActiveNet pagination changed during the check.")
+        parent_candidates.extend(page_candidates)
+        if page_number >= total_pages:
+            break
+    else:
+        raise SchedulePageError("Toronto ActiveNet search exceeded the pagination limit.")
+
+    candidates_by_id: dict[int, dict[str, Any]] = {}
+    for candidate in parent_candidates:
+        course_id = candidate["id"]
+        if candidate["num_of_sub_activities"]:
+            leaf_candidates = fetch_activenet_subactivities(
+                f"{TORONTO_ACTIVENET_URL}/rest/activities/subs/{course_id}",
+                timeout_seconds,
+                attempts=attempts,
+                retry_delay_seconds=retry_delay_seconds,
+                headers=request_headers,
+                parent_id=course_id,
+                expected_count=candidate["num_of_sub_activities"],
+            )
+        else:
+            leaf_candidates = [candidate]
+
+        for leaf in leaf_candidates:
+            leaf_id = leaf["id"]
+            previous = candidates_by_id.get(leaf_id)
+            if previous is not None and previous != leaf:
+                raise SchedulePageError(
+                    f"Toronto ActiveNet returned conflicting course {leaf_id}."
+                )
+            candidates_by_id[leaf_id] = leaf
+
     verified: list[ExamRow] = []
-    for row in candidates:
-        course_id = row.source_id.removeprefix("course:")
+    for course_id, candidate in candidates_by_id.items():
         status_data = fetch_json(
             f"{TORONTO_ACTIVENET_URL}/rest/activity/detail/buttonstatus/{course_id}?",
             timeout_seconds,
@@ -721,35 +965,52 @@ def fetch_toronto_rows(
                 ),
             },
         )
-        is_available, notification = parse_activenet_button_status(
+        is_available, notification, action_href = parse_activenet_button_status(
             status_data, course_id=course_id
         )
         if not is_available:
+            urgency = candidate.get("urgent_message")
+            urgency = urgency if isinstance(urgency, dict) else {}
             logging.info(
                 "Toronto course %s rejected by final ActiveNet status: %s",
                 course_id,
-                notification or "no enrollment action",
+                notification
+                or clean_text(str(urgency.get("status_description") or ""))
+                or "no enrollment action",
             )
             continue
 
+        detail_data = fetch_json(
+            f"{TORONTO_ACTIVENET_URL}/rest/activity/detail/{course_id}?",
+            timeout_seconds,
+            attempts=attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            headers={
+                "Referer": (
+                    f"{TORONTO_ACTIVENET_URL}/activity/search/detail/{course_id}"
+                    "?onlineSiteId=0&from_original_cui=true"
+                ),
+            },
+        )
         verified.append(
-            replace(
-                row,
-                spots_left="Available",
-                bookings="Open on ActiveNet",
-                available_override=True,
+            parse_activenet_detail(
+                detail_data,
+                candidate=candidate,
+                action_href=action_href,
             )
         )
 
     logging.info(
         "Toronto final verification accepted %s of %s candidate course(s).",
         len(verified),
-        len(candidates),
+        len(candidates_by_id),
     )
     return verified
 
 
-def parse_activenet_button_status(data: Any, *, course_id: str) -> tuple[bool, str]:
+def parse_activenet_button_status(
+    data: Any, *, course_id: str | int
+) -> tuple[bool, str, str]:
     if not isinstance(data, dict):
         raise SchedulePageError(
             f"Toronto ActiveNet status for course {course_id} was not an object."
@@ -770,17 +1031,24 @@ def parse_activenet_button_status(data: Any, *, course_id: str) -> tuple[bool, s
     action = action if isinstance(action, dict) else {}
     action_href = clean_text(str(action.get("href") or ""))
     notification = clean_text(str(status.get("notification") or ""))
-    return bool(ACTIVENET_ENROLL_ACTION_RE.search(action_href)), notification
+    return (
+        bool(ACTIVENET_ENROLL_ACTION_RE.search(action_href)),
+        notification,
+        action_href,
+    )
 
 
-def extract_aec_settings(html: str) -> tuple[str, str]:
+def extract_aec_settings(
+    html: str, *, default_base_url: str | None = None
+) -> tuple[str, str]:
     base_match = re.search(r'aec_app_url\s*=\s*["\']([^"\']+)', html)
     key_match = re.search(r'aecExtranetWebAppsAPIKey\s*=\s*["\']([^"\']+)', html)
-    if not base_match or not key_match:
+    base_url = base_match.group(1) if base_match else default_base_url
+    if not base_url or not key_match:
         raise SchedulePageError(
             "The official page no longer exposes the expected AEC registration settings."
         )
-    return base_match.group(1).rstrip("/"), key_match.group(1)
+    return base_url.rstrip("/"), key_match.group(1)
 
 
 def fetch_aec_settings(
@@ -789,6 +1057,7 @@ def fetch_aec_settings(
     *,
     attempts: int,
     retry_delay_seconds: int,
+    default_base_url: str | None = None,
 ) -> tuple[str, str]:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -799,7 +1068,7 @@ def fetch_aec_settings(
                 attempts=1,
                 retry_delay_seconds=retry_delay_seconds,
             )
-            return extract_aec_settings(html)
+            return extract_aec_settings(html, default_base_url=default_base_url)
         except (FetchPageError, SchedulePageError) as exc:
             last_error = exc
             if attempt >= attempts:
@@ -911,12 +1180,15 @@ def fetch_aec_rows(
     timeout_seconds: int,
     attempts: int,
     retry_delay_seconds: int,
+    settings_page_url: str | None = None,
+    api_base_url: str | None = None,
 ) -> list[ExamRow]:
     base_url, api_key = fetch_aec_settings(
-        page_url,
+        settings_page_url or page_url,
         timeout_seconds,
         attempts=attempts,
         retry_delay_seconds=retry_delay_seconds,
+        default_base_url=api_base_url,
     )
     type_ids = quote("|".join(str(value) for value in examination_type_ids), safe="")
     endpoint = (
@@ -969,6 +1241,8 @@ def fetch_all_city_rows(
                 timeout_seconds=timeout_seconds,
                 attempts=attempts,
                 retry_delay_seconds=retry_delay_seconds,
+                settings_page_url=MONTREAL_AEC_SETTINGS_URL,
+                api_base_url=MONTREAL_AEC_API_URL,
             ),
         ),
         (
@@ -981,6 +1255,8 @@ def fetch_all_city_rows(
                 timeout_seconds=timeout_seconds,
                 attempts=attempts,
                 retry_delay_seconds=retry_delay_seconds,
+                settings_page_url=OTTAWA_AEC_SETTINGS_URL,
+                api_base_url=OTTAWA_AEC_API_URL,
             ),
         ),
     )

@@ -24,8 +24,8 @@ from tools.tcf_monitor import (
     mark_events_sent,
     parse_aec_examinations,
     parse_activenet_button_status,
+    parse_activenet_search_page,
     parse_exam_rows,
-    parse_toronto_courses,
     fetch_toronto_rows,
 )
 
@@ -337,44 +337,87 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         error_mock.assert_called_once()
 
-    def test_toronto_feed_keeps_open_courses_and_ignores_expired_deadlines(self):
+    def test_activenet_search_keeps_only_exact_tcf_canada_exam_activities(self):
         data = {
-            "items": [
-                {
-                    "id": 101,
-                    "name": "E-TCF CANADA - 4 modules",
-                    "open_spaces": 2,
-                    "price": 390,
-                    "registration_deadline": "2026-08-05T03:59:59+00:00",
-                    "campus": {"full_name": "Alliance Francaise Toronto - Oakville"},
-                    "date_patterns": [
-                        {
-                            "activity_start_date": "2026-08-20",
-                            "activity_start_time": "08:30:00",
-                            "activity_end_time": "14:30:00",
-                        }
-                    ],
+            "headers": {
+                "response_code": "0000",
+                "page_info": {
+                    "total_page": 1,
+                    "total_records": 2,
+                    "total_records_per_page": 20,
+                    "page_number": 1,
                 },
-                {
-                    "id": 102,
-                    "name": "E-TCF CANADA - 4 modules",
-                    "open_spaces": 1,
-                    "registration_deadline": "2026-08-01T03:59:59+00:00",
-                    "campus": {"name": "Mississauga"},
-                },
-            ]
+            },
+            "body": {
+                "activity_items": [
+                    {
+                        "id": 101,
+                        "name": "E-TCF CANADA - 4 modules",
+                        "num_of_sub_activities": 1,
+                    },
+                    {
+                        "id": 102,
+                        "name": "TCF Preparation",
+                        "num_of_sub_activities": 0,
+                    },
+                ]
+            },
         }
 
-        rows = parse_toronto_courses(
-            data,
-            checked_at=datetime.fromisoformat("2026-08-04T12:00:00+00:00"),
-        )
+        candidates, total_pages = parse_activenet_search_page(data)
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].city, "Toronto")
-        self.assertEqual(rows[0].spots_left, "2")
-        self.assertTrue(rows[0].is_available)
-        self.assertIn("Activity_Search/101", rows[0].booking_links[0].href)
+        self.assertEqual([candidate["id"] for candidate in candidates], [101])
+        self.assertEqual(total_pages, 1)
+
+    def test_toronto_retries_an_incomplete_empty_search_page(self):
+        incomplete = {
+            "headers": {
+                "response_code": "0000",
+                "page_info": {
+                    "total_page": 1,
+                    "total_records": 13,
+                    "total_records_per_page": 20,
+                    "page_number": 1,
+                },
+            },
+            "body": {"activity_items": []},
+        }
+        complete_without_exams = {
+            "headers": {
+                "response_code": "0000",
+                "page_info": {
+                    "total_page": 1,
+                    "total_records": 1,
+                    "total_records_per_page": 20,
+                    "page_number": 1,
+                },
+            },
+            "body": {
+                "activity_items": [
+                    {
+                        "id": 999,
+                        "name": "TCF Preparation",
+                        "num_of_sub_activities": 0,
+                    }
+                ]
+            },
+        }
+        with (
+            patch(
+                "tools.tcf_monitor.fetch_json",
+                side_effect=[incomplete, complete_without_exams],
+            ) as fetch_mock,
+            patch("tools.tcf_monitor.time.sleep"),
+        ):
+            rows = fetch_toronto_rows(
+                20,
+                attempts=2,
+                retry_delay_seconds=0,
+                checked_at=datetime.fromisoformat("2026-08-04T12:00:00+00:00"),
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(fetch_mock.call_count, 2)
 
     def test_activenet_requires_a_real_enrollment_action(self):
         available = {
@@ -409,37 +452,58 @@ class TcfMonitorTest(unittest.TestCase):
 
         self.assertEqual(
             parse_activenet_button_status(available, course_id="101"),
-            (True, ""),
+            (True, "", "/aftoronto/activity/search/enroll/101"),
         )
         self.assertEqual(
             parse_activenet_button_status(full, course_id="101"),
-            (False, "We're sorry, but this Course is full."),
+            (False, "We're sorry, but this Course is full.", ""),
         )
         self.assertEqual(
             parse_activenet_button_status(on_hold, course_id="101"),
-            (False, "This course is on hold to further registration."),
+            (False, "This course is on hold to further registration.", ""),
         )
 
-    def test_toronto_fetch_rejects_stale_open_space_candidates(self):
-        courses = {
-            "items": [
-                {
-                    "id": 101,
-                    "name": "E-TCF CANADA - 4 modules",
-                    "open_spaces": 1,
-                    "price": 390,
-                    "campus": {"name": "North York"},
-                    "start_date": "2026-08-18T00:00:00+00:00",
+    def test_toronto_fetch_expands_subcourses_and_requires_final_action(self):
+        search = {
+            "headers": {
+                "response_code": "0000",
+                "page_info": {
+                    "total_page": 1,
+                    "total_records": 2,
+                    "total_records_per_page": 20,
+                    "page_number": 1,
                 },
-                {
-                    "id": 102,
-                    "name": "E-TCF CANADA - 4 modules",
-                    "open_spaces": 2,
-                    "price": 390,
-                    "campus": {"name": "Oakville"},
-                    "start_date": "2026-08-20T00:00:00+00:00",
-                },
-            ]
+            },
+            "body": {
+                "activity_items": [
+                    {
+                        "id": 101,
+                        "name": "E-TCF CANADA - 4 modules",
+                        "num_of_sub_activities": 1,
+                    },
+                    {
+                        "id": 103,
+                        "name": "E-TCF CANADA - 4 modules",
+                        "num_of_sub_activities": 0,
+                        "number": "TCFC200826-MS",
+                        "fee": {"label": "$400.00"},
+                        "location": {"label": "North York"},
+                    },
+                ]
+            },
+        }
+        subcourses = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "sub_activities": [
+                    {
+                        "id": 102,
+                        "name": "E-TCF CANADA - 4 modules",
+                        "num_of_sub_activities": 0,
+                        "urgent_message": {"status_description": "Full"},
+                    }
+                ]
+            },
         }
         full_status = {
             "headers": {"response_code": "0000"},
@@ -455,16 +519,29 @@ class TcfMonitorTest(unittest.TestCase):
             "body": {
                 "button_status": {
                     "action_link": {
-                        "href": "/aftoronto/activity/search/enroll/102",
+                        "href": "/aftoronto/activity/search/enroll/103",
                     },
                     "notification": "",
+                }
+            },
+        }
+        detail = {
+            "headers": {"response_code": "0000"},
+            "body": {
+                "detail": {
+                    "activity_id": 103,
+                    "activity_name": "E-TCF CANADA - 4 modules",
+                    "first_date": "2026-08-20",
+                    "last_date": "2026-08-20",
+                    "location_description": "North York",
+                    "space_status": "1 opening remaining",
                 }
             },
         }
 
         with patch(
             "tools.tcf_monitor.fetch_json",
-            side_effect=[courses, full_status, available_status],
+            side_effect=[search, subcourses, full_status, available_status, detail],
         ) as fetch_mock:
             rows = fetch_toronto_rows(
                 20,
@@ -474,9 +551,13 @@ class TcfMonitorTest(unittest.TestCase):
             )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].source_id, "course:102")
-        self.assertEqual(rows[0].spots_left, "Available")
-        self.assertEqual(fetch_mock.call_count, 3)
+        self.assertEqual(rows[0].source_id, "course:103")
+        self.assertEqual(rows[0].spots_left, "1 opening remaining")
+        self.assertTrue(rows[0].is_available)
+        self.assertIn("/activity/search/enroll/103", rows[0].booking_links[0].href)
+        self.assertEqual(fetch_mock.call_count, 5)
+        self.assertIsNotNone(fetch_mock.call_args_list[0].kwargs["json_body"])
+        self.assertEqual(fetch_mock.call_args_list[1].kwargs["json_body"], {})
 
     def test_aec_feed_distinguishes_bookable_and_full_sessions(self):
         data = [
@@ -552,6 +633,18 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertEqual(
             extract_aec_settings(html),
             ("https://city.aec.app", "public-page-key"),
+        )
+        direct_registration_html = """
+        <script>
+          var aecExtranetWebAppsAPIKey = 'direct-registration-key';
+        </script>
+        """
+        self.assertEqual(
+            extract_aec_settings(
+                direct_registration_html,
+                default_base_url="https://city.aec.app",
+            ),
+            ("https://city.aec.app", "direct-registration-key"),
         )
         with self.assertRaises(SchedulePageError):
             extract_aec_settings("<html>changed</html>")
