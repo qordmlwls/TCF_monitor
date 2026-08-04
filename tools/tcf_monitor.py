@@ -783,6 +783,44 @@ def extract_aec_settings(html: str) -> tuple[str, str]:
     return base_match.group(1).rstrip("/"), key_match.group(1)
 
 
+def fetch_aec_settings(
+    page_url: str,
+    timeout_seconds: int,
+    *,
+    attempts: int,
+    retry_delay_seconds: int,
+) -> tuple[str, str]:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            html = fetch_page(
+                page_url,
+                timeout_seconds,
+                attempts=1,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+            return extract_aec_settings(html)
+        except (FetchPageError, SchedulePageError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = retry_delay_seconds * attempt
+            logging.warning(
+                "AEC settings attempt %s/%s failed for %s: %s. Retrying in %ss.",
+                attempt,
+                attempts,
+                page_url,
+                exc,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    raise FetchPageError(
+        f"Failed to load AEC registration settings from {page_url} after "
+        f"{attempts} attempts: {last_error}"
+    )
+
+
 def aec_spots_text(exam: dict[str, Any]) -> str:
     quantity = exam.get("qty_student")
     maximum = exam.get("max_student")
@@ -874,13 +912,12 @@ def fetch_aec_rows(
     attempts: int,
     retry_delay_seconds: int,
 ) -> list[ExamRow]:
-    html = fetch_page(
+    base_url, api_key = fetch_aec_settings(
         page_url,
         timeout_seconds,
         attempts=attempts,
         retry_delay_seconds=retry_delay_seconds,
     )
-    base_url, api_key = extract_aec_settings(html)
     type_ids = quote("|".join(str(value) for value in examination_type_ids), safe="")
     endpoint = (
         f"{base_url}/api/v1/public/examinations/list/{branch_id}/{type_ids}?"

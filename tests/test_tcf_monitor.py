@@ -16,6 +16,7 @@ from tools.tcf_monitor import (
     SchedulePageError,
     detect_events,
     extract_aec_settings,
+    fetch_aec_settings,
     fetch_all_city_rows,
     fetch_json,
     fetch_schedule_rows,
@@ -554,6 +555,46 @@ class TcfMonitorTest(unittest.TestCase):
         )
         with self.assertRaises(SchedulePageError):
             extract_aec_settings("<html>changed</html>")
+
+    def test_aec_settings_retry_temporary_challenge_html(self):
+        valid_html = """
+        <script>
+          var aec_app_url = "https://city.aec.app";
+          var aecExtranetWebAppsAPIKey = "public-page-key";
+        </script>
+        """
+        with (
+            patch(
+                "tools.tcf_monitor.fetch_page",
+                side_effect=["<html>Temporary challenge</html>", valid_html],
+            ) as fetch_mock,
+            patch("tools.tcf_monitor.time.sleep"),
+        ):
+            settings = fetch_aec_settings(
+                "https://example.test/tcf",
+                20,
+                attempts=2,
+                retry_delay_seconds=0,
+            )
+
+        self.assertEqual(settings, ("https://city.aec.app", "public-page-key"))
+        self.assertEqual(fetch_mock.call_count, 2)
+
+    def test_aec_settings_exhaustion_becomes_preserved_fetch_failure(self):
+        with (
+            patch(
+                "tools.tcf_monitor.fetch_page",
+                return_value="<html>Temporary challenge</html>",
+            ),
+            patch("tools.tcf_monitor.time.sleep"),
+        ):
+            with self.assertRaises(FetchPageError):
+                fetch_aec_settings(
+                    "https://example.test/tcf",
+                    20,
+                    attempts=2,
+                    retry_delay_seconds=0,
+                )
 
     def test_city_source_ids_do_not_collide(self):
         common = dict(
