@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from dataclasses import replace
@@ -26,6 +27,7 @@ from tools.tcf_monitor import (
     parse_activenet_button_status,
     parse_activenet_search_page,
     parse_exam_rows,
+    record_activenet_candidate,
     fetch_toronto_rows,
 )
 
@@ -419,6 +421,86 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(fetch_mock.call_count, 2)
 
+    def test_toronto_sends_pagination_in_activenet_header(self):
+        def search_page(page_number, items):
+            return {
+                "headers": {
+                    "response_code": "0000",
+                    "page_info": {
+                        "total_page": 2,
+                        "total_records": 21,
+                        "total_records_per_page": 20,
+                        "page_number": page_number,
+                    },
+                },
+                "body": {"activity_items": items},
+            }
+
+        preparation = {
+            "id": 999,
+            "name": "TCF Preparation",
+            "num_of_sub_activities": 0,
+        }
+        page_one_items = [
+            {**preparation, "id": 900 + index} for index in range(20)
+        ]
+        page_two_items = [{**preparation, "id": 999}]
+        with patch(
+            "tools.tcf_monitor.fetch_json",
+            side_effect=[
+                search_page(1, page_one_items),
+                search_page(2, page_two_items),
+            ],
+        ) as fetch_mock:
+            rows = fetch_toronto_rows(
+                20,
+                attempts=1,
+                retry_delay_seconds=0,
+                checked_at=datetime.fromisoformat("2026-08-17T12:00:00+00:00"),
+            )
+
+        self.assertEqual(rows, [])
+        page_headers = [
+            json.loads(call.kwargs["headers"]["page_info"])
+            for call in fetch_mock.call_args_list
+        ]
+        self.assertEqual([header["page_number"] for header in page_headers], [1, 2])
+        self.assertNotIn("page_info", fetch_mock.call_args_list[0].kwargs["json_body"])
+
+    def test_activenet_duplicate_metadata_uses_stable_course_identity(self):
+        candidates = {}
+        record_activenet_candidate(
+            candidates,
+            {
+                "id": 129584,
+                "name": "E-TCF CANADA - 4 modules",
+                "number": "SCTCFC041126-MS",
+                "urgent_message": {"status_description": "Full"},
+            },
+        )
+        record_activenet_candidate(
+            candidates,
+            {
+                "id": 129584,
+                "name": "E-TCF CANADA - 4 modules",
+                "number": "SCTCFC041126-MS",
+                "urgent_message": {"status_description": ""},
+                "fee": {"label": "$400.00"},
+            },
+        )
+
+        self.assertEqual(list(candidates), [129584])
+        self.assertEqual(candidates[129584]["fee"]["label"], "$400.00")
+        with self.assertRaises(SchedulePageError):
+            record_activenet_candidate(
+                candidates,
+                {
+                    "id": 129584,
+                    "name": "E-TCF CANADA - 4 modules",
+                    "number": "DIFFERENT-COURSE",
+                },
+            )
+
     def test_activenet_requires_a_real_enrollment_action(self):
         available = {
             "headers": {"response_code": "0000"},
@@ -556,7 +638,11 @@ class TcfMonitorTest(unittest.TestCase):
         self.assertTrue(rows[0].is_available)
         self.assertIn("/activity/search/enroll/103", rows[0].booking_links[0].href)
         self.assertEqual(fetch_mock.call_count, 5)
-        self.assertIsNotNone(fetch_mock.call_args_list[0].kwargs["json_body"])
+        page_info = json.loads(
+            fetch_mock.call_args_list[0].kwargs["headers"]["page_info"]
+        )
+        self.assertEqual(page_info["page_number"], 1)
+        self.assertNotIn("page_info", fetch_mock.call_args_list[0].kwargs["json_body"])
         self.assertEqual(fetch_mock.call_args_list[1].kwargs["json_body"], {})
 
     def test_aec_feed_distinguishes_bookable_and_full_sessions(self):

@@ -615,7 +615,9 @@ def fetch_schedule_rows(
     return rows
 
 
-def parse_activenet_search_page(data: Any) -> tuple[list[dict[str, Any]], int]:
+def parse_activenet_search_page(
+    data: Any, *, expected_page_number: int | None = None
+) -> tuple[list[dict[str, Any]], int]:
     if not isinstance(data, dict):
         raise SchedulePageError("Toronto ActiveNet search response was not an object.")
     headers = data.get("headers")
@@ -640,6 +642,11 @@ def parse_activenet_search_page(data: Any) -> tuple[list[dict[str, Any]], int]:
         or page_number < 1
     ):
         raise SchedulePageError("Toronto ActiveNet search returned invalid pagination.")
+    if expected_page_number is not None and page_number != expected_page_number:
+        raise FetchPageError(
+            "Toronto ActiveNet returned the wrong search page "
+            f"({page_number} instead of {expected_page_number})."
+        )
 
     body = data.get("body")
     items = body.get("activity_items") if isinstance(body, dict) else None
@@ -685,6 +692,7 @@ def fetch_activenet_search_page(
     retry_delay_seconds: int,
     headers: dict[str, str],
     json_body: dict[str, Any],
+    expected_page_number: int,
 ) -> tuple[list[dict[str, Any]], int]:
     last_error: FetchPageError | None = None
     for attempt in range(1, attempts + 1):
@@ -697,7 +705,9 @@ def fetch_activenet_search_page(
                 headers=headers,
                 json_body=json_body,
             )
-            return parse_activenet_search_page(data)
+            return parse_activenet_search_page(
+                data, expected_page_number=expected_page_number
+            )
         except FetchPageError as exc:
             last_error = exc
             if attempt >= attempts:
@@ -717,6 +727,33 @@ def fetch_activenet_search_page(
         f"Toronto ActiveNet search remained incomplete after {attempts} attempts: "
         f"{last_error}"
     )
+
+
+def record_activenet_candidate(
+    candidates_by_id: dict[int, dict[str, Any]], candidate: dict[str, Any]
+) -> None:
+    course_id = candidate["id"]
+    previous = candidates_by_id.get(course_id)
+    if previous is None:
+        candidates_by_id[course_id] = candidate
+        return
+
+    previous_name = clean_text(str(previous.get("name") or "")).lower()
+    candidate_name = clean_text(str(candidate.get("name") or "")).lower()
+    previous_number = clean_text(str(previous.get("number") or ""))
+    candidate_number = clean_text(str(candidate.get("number") or ""))
+    if previous_name != candidate_name or (
+        previous_number and candidate_number and previous_number != candidate_number
+    ):
+        raise SchedulePageError(
+            f"Toronto ActiveNet returned conflicting identity for course {course_id}."
+        )
+
+    merged = previous.copy()
+    for key, value in candidate.items():
+        if key not in merged or merged[key] in (None, "", [], {}):
+            merged[key] = value
+    candidates_by_id[course_id] = merged
 
 
 def parse_activenet_subactivities(
@@ -897,29 +934,37 @@ def fetch_toronto_rows(
     parent_candidates: list[dict[str, Any]] = []
     expected_pages: int | None = None
     for page_number in range(1, MAX_TABLE_PAGES + 1):
+        page_headers = {
+            **request_headers,
+            # ActiveNet's web client transmits pagination as a JSON HTTP header.
+            "page_info": json.dumps(
+                {
+                    "page_number": page_number,
+                    "total_records_per_page": 20,
+                    "order_by": "Name",
+                },
+                separators=(",", ":"),
+            ),
+        }
         page_candidates, total_pages = fetch_activenet_search_page(
             search_url,
             timeout_seconds,
             attempts=attempts,
             retry_delay_seconds=retry_delay_seconds,
-            headers=request_headers,
+            headers=page_headers,
             json_body={
                 "activity_search_pattern": {
                     "activity_keyword": "TCF",
                     "activity_select_param": "2",
                 },
                 "activity_transfer_pattern": {},
-                "page_info": {
-                    "page_number": page_number,
-                    "total_records_per_page": 20,
-                    "order_by": "Name",
-                },
             },
+            expected_page_number=page_number,
         )
         if expected_pages is None:
             expected_pages = total_pages
         elif total_pages != expected_pages:
-            raise SchedulePageError("Toronto ActiveNet pagination changed during the check.")
+            raise FetchPageError("Toronto ActiveNet pagination changed during the check.")
         parent_candidates.extend(page_candidates)
         if page_number >= total_pages:
             break
@@ -943,13 +988,7 @@ def fetch_toronto_rows(
             leaf_candidates = [candidate]
 
         for leaf in leaf_candidates:
-            leaf_id = leaf["id"]
-            previous = candidates_by_id.get(leaf_id)
-            if previous is not None and previous != leaf:
-                raise SchedulePageError(
-                    f"Toronto ActiveNet returned conflicting course {leaf_id}."
-                )
-            candidates_by_id[leaf_id] = leaf
+            record_activenet_candidate(candidates_by_id, leaf)
 
     verified: list[ExamRow] = []
     for course_id, candidate in candidates_by_id.items():
