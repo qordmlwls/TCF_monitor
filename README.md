@@ -26,16 +26,17 @@ It does not automate checkout, payment, CAPTCHA, queueing, or final registration
 submission. You should review the official page yourself before submitting
 payment or registration details.
 
-## Free Edmonton Apps Script Pilot
+## Free Google-Hosted Preferred-Centre Monitor
 
-An independent Edmonton-only checker is available in
+Independent North York, Edmonton, and Montreal checks are available in
 [`apps-script/edmonton`](apps-script/edmonton/README.md). It requests a Google-hosted
 check every five minutes, sends email through Google authorization, and records
 full schedule snapshots and actual check gaps in a private spreadsheet.
 
 This is a parallel pilot, not an automatic replacement for GitHub Actions.
-Uploading the code does not activate it: run `installPilot` in its Apps Script
-project and authorize it. Configure the independent Healthchecks.io watchdog,
+Uploading the code does not activate it: run `installAllCities` in its Apps Script
+project and authorize it. This upgrades the existing Edmonton project in place,
+preserving its notification history. Configure a separate Healthchecks.io watchdog for each city,
 then validate actual Google-hosted timing and email delivery before relying on
 it. A green test run or configured trigger does not prove ongoing coverage.
 

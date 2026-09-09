@@ -1,7 +1,9 @@
 import { build } from "esbuild";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 
-const handlers = ["installPilot", "dryRun", "testAlert", "checkEdmonton", "showStatus", "sendDailyReport", "stopPilot", "testWatchdogFailure"];
+const handlers = ["installAllCities", "dryRunAllCities", "checkAllCities", "showAllStatus", "sendAllDailyReport", "stopAllCities",
+  "dryRunNorthYork", "dryRunMontreal", "testNorthYorkWatchdog", "testMontrealWatchdog",
+  "installPilot", "dryRun", "testAlert", "checkEdmonton", "showStatus", "sendDailyReport", "stopPilot", "testWatchdogFailure"];
 await mkdir(new URL("./dist/", import.meta.url), { recursive: true });
 const result = await build({ entryPoints: [new URL("./src/apps-script.js", import.meta.url).pathname], bundle: true,
   format: "iife", globalName: "EdmontonMonitor", platform: "browser", target: "es2020", charset: "ascii",

@@ -180,10 +180,13 @@ export function classify(row, edmontonWallTimeMs) {
 }
 
 export function evaluate(rows, previous, checkedAt, edmontonWallTimeMs) {
+  return evaluateSnapshot(rows.map(row => ({ ...row, ...classify(row, edmontonWallTimeMs) })), previous, checkedAt);
+}
+
+export function evaluateSnapshot(snapshot, previous, checkedAt) {
   const next = { ...previous };
   const events = [];
   const changes = [];
-  const snapshot = rows.map(row => ({ ...row, ...classify(row, edmontonWallTimeMs) }));
   const present = new Set();
   for (const row of snapshot) {
     present.add(row.key);
@@ -191,6 +194,8 @@ export function evaluate(rows, previous, checkedAt, edmontonWallTimeMs) {
     const fingerprint = JSON.stringify([row.spotsLeft, row.bookings, row.links, row.registrationDates, row.available]);
     const notified = Boolean(old?.available && old?.notified);
     next[row.key] = { available: row.available, notified: row.available && notified, fingerprint, lastSeen: checkedAt };
+    if (row.city === "North York") next[row.key].row = { city: row.city, sourceId: row.sourceId,
+      examDate: row.examDate, exam: row.exam, location: row.location, price: row.price };
     if (row.available && !notified) events.push(row);
     if (!old || old.fingerprint !== fingerprint) changes.push({ ...row, previousAvailable: old?.available ?? null });
   }

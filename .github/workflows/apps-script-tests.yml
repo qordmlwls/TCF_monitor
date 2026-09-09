@@ -1,4 +1,4 @@
-name: Edmonton Apps Script Tests
+name: Preferred-Centre Apps Script Tests
 
 on:
   push:

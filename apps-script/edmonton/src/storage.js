@@ -1,10 +1,8 @@
-const PREFIX = "EDMONTON_STATE_";
-
 export function emptyState() {
   return { version: 1, seen: {}, recent: [], lastSuccess: null, failures: 0 };
 }
 
-export function loadState(properties) {
+export function loadState(properties, PREFIX = "EDMONTON_STATE_") {
   const pointer = properties.getProperty(`${PREFIX}ACTIVE`);
   if (!pointer) return emptyState();
   const { bank, count } = JSON.parse(pointer);
@@ -22,12 +20,12 @@ export function loadState(properties) {
   return state;
 }
 
-export function saveState(properties, state) {
+export function saveState(properties, state, PREFIX = "EDMONTON_STATE_", maxChunks = 24) {
   // ASCII chunks stay below Apps Script's 9 KB per-value limit, even for French text.
   const json = JSON.stringify(state).replace(/[\u007f-\uffff]/g, c =>
     `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
   const chunks = json.match(/[\s\S]{1,7500}/g);
-  if (chunks.length > 24) throw new Error("State exceeds its storage budget; preserving the previous state.");
+  if (chunks.length > maxChunks) throw new Error("State exceeds its storage budget; preserving the previous state.");
   const pointer = properties.getProperty(`${PREFIX}ACTIVE`);
   const bank = pointer && JSON.parse(pointer).bank === "A" ? "B" : "A";
   const values = {};

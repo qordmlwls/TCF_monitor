@@ -576,13 +576,23 @@ var EdmontonMonitor = (() => {
   // src/apps-script.js
   var apps_script_exports = {};
   __export(apps_script_exports, {
+    checkAllCities: () => checkAllCities,
     checkEdmonton: () => checkEdmonton,
     dryRun: () => dryRun,
+    dryRunAllCities: () => dryRunAllCities,
+    dryRunMontreal: () => dryRunMontreal,
+    dryRunNorthYork: () => dryRunNorthYork,
+    installAllCities: () => installAllCities,
     installPilot: () => installPilot,
+    sendAllDailyReport: () => sendAllDailyReport,
     sendDailyReport: () => sendDailyReport,
+    showAllStatus: () => showAllStatus,
     showStatus: () => showStatus,
+    stopAllCities: () => stopAllCities,
     stopPilot: () => stopPilot,
     testAlert: () => testAlert,
+    testMontrealWatchdog: () => testMontrealWatchdog,
+    testNorthYorkWatchdog: () => testNorthYorkWatchdog,
     testWatchdogFailure: () => testWatchdogFailure
   });
 
@@ -3174,7 +3184,6 @@ var EdmontonMonitor = (() => {
   // src/core.js
   var import_url_parse = __toESM(require_url_parse(), 1);
   var PAGE_URL = "https://www.afedmonton.com/en/exams/tcf/";
-  var INTERVAL_MINUTES = 5;
   var HEADERS = ["exam", "schedules", "registration dates", "location", "spots left", "price", "bookings"];
   var SOLD_OUT = /\b(sold\s*out|fully booked|full|no spots?|cancelled|canceled)\b/i;
   var CLOSED = /\b(closed|not available|unavailable|not open|registration ended|opens? (?:in|on|soon)|wait\s*list|on hold)\b/i;
@@ -3333,10 +3342,12 @@ var EdmontonMonitor = (() => {
     return { available: true, reason: "active_booking_link" };
   }
   function evaluate(rows, previous, checkedAt, edmontonWallTimeMs) {
+    return evaluateSnapshot(rows.map((row) => ({ ...row, ...classify(row, edmontonWallTimeMs) })), previous, checkedAt);
+  }
+  function evaluateSnapshot(snapshot, previous, checkedAt) {
     const next = { ...previous };
     const events = [];
     const changes = [];
-    const snapshot = rows.map((row) => ({ ...row, ...classify(row, edmontonWallTimeMs) }));
     const present = /* @__PURE__ */ new Set();
     for (const row of snapshot) {
       present.add(row.key);
@@ -3344,6 +3355,14 @@ var EdmontonMonitor = (() => {
       const fingerprint = JSON.stringify([row.spotsLeft, row.bookings, row.links, row.registrationDates, row.available]);
       const notified = Boolean(old?.available && old?.notified);
       next[row.key] = { available: row.available, notified: row.available && notified, fingerprint, lastSeen: checkedAt };
+      if (row.city === "North York") next[row.key].row = {
+        city: row.city,
+        sourceId: row.sourceId,
+        examDate: row.examDate,
+        exam: row.exam,
+        location: row.location,
+        price: row.price
+      };
       if (row.available && !notified) events.push(row);
       if (!old || old.fingerprint !== fingerprint) changes.push({ ...row, previousAvailable: old?.available ?? null });
     }
@@ -3378,13 +3397,343 @@ var EdmontonMonitor = (() => {
     ].join("\n");
   }
 
+  // src/providers.js
+  var import_url_parse2 = __toESM(require_url_parse(), 1);
+  var NORTH_YORK_PAGE = "https://www.alliance-francaise.ca/en/exams/tests/informations-about-tcf-canada/tcf-canada";
+  var ACTIVE_BASE = "https://anc.ca.apm.activecommunities.com/aftoronto";
+  var MONTREAL_PAGE = "https://www.afmontreal.ca/en/tcf-2/";
+  var MONTREAL_SETTINGS = "https://afmontreal.extranet-aec.com/examinations/examination_type_detail?examinationTypeId=10";
+  var MONTREAL_API = "https://afmontreal.aec.app";
+  var EXAM = /^(?:[ep]-)?tcf canada(?:\s*-\s*4 modules)?$/i;
+  var BLOCKED = /\b(sold\s*out|full(?:y booked)?|closed|cancelled|canceled|unavailable|not available|wait\s*list|on hold|not (?:yet )?open|opens? (?:in|on|soon))\b/i;
+  var MAX_PAGES = 10;
+  var MAX_COURSES = 120;
+  function object(value, label) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}: expected an object.`);
+    return value;
+  }
+  function integer(value, label, min = 0) {
+    if (!Number.isSafeInteger(value) || value < min) throw new Error(`${label}: invalid integer.`);
+    return value;
+  }
+  function json(response, label) {
+    if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}; availability unknown.`);
+    if (response.body.length > 3e6) throw new Error(`${label}: response too large.`);
+    try {
+      return JSON.parse(response.body);
+    } catch (_) {
+      throw new Error(`${label}: invalid JSON response.`);
+    }
+  }
+  function activeBody(data, label) {
+    object(data, label);
+    if (object(data.headers, label).response_code !== "0000") throw new Error(`${label}: provider did not report success.`);
+    return object(data.body, label);
+  }
+  function isoDate(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value || "")) return null;
+    const date = /* @__PURE__ */ new Date(`${value}T00:00:00Z`);
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value ? value : null;
+  }
+  function dayMonthYear(value) {
+    const match = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(clean(value));
+    return match ? isoDate(`${match[3]}-${match[2]}-${match[1]}`) : null;
+  }
+  function northYorkLocation(value) {
+    const text = clean(value);
+    const northYork2 = /\bnorth[\s-]*york\b|\bjim doak\b|\b47\s+sheppard\s+(?:avenue|ave\.?)\s+(?:east|e\b)/i.test(text);
+    const other = /\boakville\b|\bmississauga\b|\bspadina\b|\bmarkham\b/i.test(text);
+    if (northYork2 && other) throw new Error("Conflicting North York campus identity.");
+    if (northYork2) return true;
+    if (other) return false;
+    return null;
+  }
+  function parseActiveSearch(data, expectedPage) {
+    const body = activeBody(data, "North York search");
+    const info = object(data.headers.page_info, "North York pagination");
+    const page = integer(info.page_number, "page number", 1);
+    const pages = integer(info.total_page, "page count", 1);
+    const total = integer(info.total_records, "record count");
+    const size = integer(info.total_records_per_page, "page size", 1);
+    if (page !== expectedPage || pages > MAX_PAGES || page > pages || pages !== Math.max(1, Math.ceil(total / size))) {
+      throw new Error("North York returned inconsistent pagination.");
+    }
+    if (!Array.isArray(body.activity_items) || body.activity_items.length !== Math.min(size, Math.max(0, total - (page - 1) * size))) {
+      throw new Error("North York returned an incomplete search page.");
+    }
+    const ids = /* @__PURE__ */ new Set();
+    const candidates = [];
+    for (const item of body.activity_items) {
+      object(item, "North York activity");
+      integer(item.id, "activity id", 1);
+      if (ids.has(item.id)) throw new Error("North York search repeated an activity.");
+      ids.add(item.id);
+      if (!EXAM.test(clean(item.name))) continue;
+      integer(item.num_of_sub_activities, "sub-activity count");
+      candidates.push(item);
+    }
+    return { candidates, pages, total, size, ids: [...ids] };
+  }
+  function parseActiveChildren(data, parent) {
+    const body = activeBody(data, "North York sub-courses");
+    if (!Array.isArray(body.sub_activities) || body.sub_activities.length !== parent.num_of_sub_activities) {
+      throw new Error(`North York parent ${parent.id} returned incomplete sub-courses.`);
+    }
+    const ids = /* @__PURE__ */ new Set();
+    return body.sub_activities.map((item) => {
+      object(item, "North York sub-course");
+      integer(item.id, "sub-course id", 1);
+      if (ids.has(item.id) || !EXAM.test(clean(item.name)) || item.num_of_sub_activities !== 0 || item.parent_activity === true) {
+        throw new Error("Unsupported or conflicting North York sub-course.");
+      }
+      ids.add(item.id);
+      return item;
+    });
+  }
+  function enrollmentUrl(href, id) {
+    const url = new import_url_parse2.default(clean(href), ACTIVE_BASE + "/", true);
+    if (url.protocol !== "https:" || url.host !== "anc.ca.apm.activecommunities.com" || url.auth || url.hash || !new RegExp(`^/aftoronto/activity/(?:search/)?enroll/${id}/?$`).test(url.pathname)) return null;
+    return url.toString();
+  }
+  function parseNorthYorkCourse(candidate, detailData, statusData, today) {
+    const detail = object(activeBody(detailData, "North York course detail").detail, "North York course detail");
+    const status = object(activeBody(statusData, "North York final enrollment status").button_status, "North York final enrollment status");
+    if (detail.activity_id !== candidate.id || !EXAM.test(clean(detail.activity_name)) || detail.is_parent_activity !== false) {
+      throw new Error("North York course detail has a conflicting identity or is not a leaf course.");
+    }
+    const location = clean(detail.location_description);
+    const campus = northYorkLocation(location);
+    if (campus === false) return null;
+    if (campus === null) throw new Error(`Cannot identify the campus of TCF course ${candidate.id}.`);
+    if (northYorkLocation(candidate.location?.label) === false) throw new Error("North York campus changed between search and detail.");
+    const date = isoDate(detail.first_date);
+    if (!date || detail.last_date && detail.last_date !== date) throw new Error("North York TCF exam date is missing or ambiguous.");
+    const action = object(status.action_link || {}, "North York enrollment action");
+    const href = enrollmentUrl(action.href, candidate.id);
+    const bookings = clean(status.notification || action.label || "No enrollment action");
+    const spots = clean(detail.space_status || candidate.urgent_message?.status_description || "Not published");
+    const closed = BLOCKED.test([bookings, spots, detail.space_message, candidate.urgent_message?.status_description].join(" ")) || /^0\b/.test(spots);
+    let available = false, reason = "no_final_enrollment_action";
+    if (closed) reason = "closed_or_full";
+    else if (date < today) reason = "past_exam";
+    else if (href && /^enroll now$/i.test(clean(action.label)) && action.disabled !== true && action.enabled !== false && status.time_remaining === 0) {
+      available = true;
+      reason = "verified_enrollment_action";
+    } else if (action.href && /enroll/i.test(`${action.label} ${action.href}`) && !href) {
+      throw new Error("North York exposed an unrecognized or mismatched enrollment URL.");
+    }
+    return {
+      city: "North York",
+      priority: 1,
+      sourceId: candidate.id,
+      key: `north-york:course:${candidate.id}`,
+      exam: clean(detail.activity_name),
+      examDate: date,
+      schedule: date,
+      location,
+      registrationDates: "Final registration status checked live",
+      spotsLeft: spots,
+      price: clean(candidate.fee?.label),
+      bookings,
+      links: available ? [href] : [],
+      pageUrl: NORTH_YORK_PAGE,
+      available,
+      reason
+    };
+  }
+  function client(request, batch, now) {
+    const started = now();
+    let count = 0;
+    const guard = (amount) => {
+      count += amount;
+      if (count > 300 || now() - started > 45e3) throw new Error("Provider request/time budget exceeded; result is incomplete.");
+    };
+    return {
+      get count() {
+        return count;
+      },
+      one(url, options = {}) {
+        guard(1);
+        return request(url, options);
+      },
+      many(specs) {
+        const responses = [];
+        for (let i = 0; i < specs.length; i += 8) {
+          const group = specs.slice(i, i + 8);
+          guard(group.length);
+          const result = batch ? batch(group) : group.map((s) => request(s.url, s.options));
+          if (!Array.isArray(result) || result.length !== group.length) throw new Error("Provider batch returned incomplete responses.");
+          responses.push(...result);
+        }
+        return responses;
+      }
+    };
+  }
+  function fetchNorthYork(request, { seen = {}, today, now = Date.now } = {}, batch) {
+    if (!isoDate(today)) throw new Error("North York requires a valid local date.");
+    const http = client(request, batch, now);
+    const referer = `${ACTIVE_BASE}/activity/search?onlineSiteId=0&activity_select_param=2&activity_keyword=TCF&viewMode=list`;
+    const headers = { Referer: referer, Origin: "https://anc.ca.apm.activecommunities.com" };
+    const parents = [], searchIds = /* @__PURE__ */ new Set();
+    let catalog;
+    for (let page = 1; page <= MAX_PAGES; page += 1) {
+      const data = json(http.one(`${ACTIVE_BASE}/rest/activities/list`, {
+        method: "post",
+        contentType: "application/json",
+        headers: { ...headers, page_info: JSON.stringify({ page_number: page, total_records_per_page: 20, order_by: "Name" }) },
+        payload: JSON.stringify({ activity_search_pattern: { activity_keyword: "TCF", activity_select_param: "2" }, activity_transfer_pattern: {} })
+      }), "North York search");
+      const parsed = parseActiveSearch(data, page);
+      if (catalog && (parsed.pages !== catalog.pages || parsed.total !== catalog.total || parsed.size !== catalog.size)) throw new Error("North York catalog changed during pagination.");
+      catalog = parsed;
+      for (const id of parsed.ids) {
+        if (searchIds.has(id)) throw new Error("North York returned the same activity on multiple pages.");
+        searchIds.add(id);
+      }
+      parents.push(...parsed.candidates);
+      if (page === parsed.pages) break;
+    }
+    const expandable = parents.filter((p) => p.num_of_sub_activities > 0);
+    const children = http.many(expandable.map((p) => ({
+      url: `${ACTIVE_BASE}/rest/activities/subs/${p.id}`,
+      options: { method: "post", contentType: "application/json", payload: "{}", headers }
+    })));
+    const leaves = parents.filter((p) => !p.num_of_sub_activities);
+    children.forEach((response, i) => leaves.push(...parseActiveChildren(json(response, "North York sub-courses"), expandable[i])));
+    const byId = /* @__PURE__ */ new Map();
+    for (const candidate of leaves) {
+      const old = byId.get(candidate.id);
+      if (old && (old.name !== candidate.name || old.number !== candidate.number || old.location?.label !== candidate.location?.label)) {
+        throw new Error("Conflicting duplicate North York course.");
+      }
+      byId.set(candidate.id, candidate);
+    }
+    for (const old of Object.values(seen)) {
+      const row = old.row;
+      if (old.available && row?.city === "North York" && isoDate(row.examDate) >= today && !byId.has(row.sourceId)) {
+        byId.set(row.sourceId, { id: row.sourceId, name: row.exam, location: { label: row.location }, fee: { label: row.price } });
+      }
+    }
+    const candidates = [...byId.values()].filter((c) => northYorkLocation(c.location?.label) !== false);
+    if (candidates.length > MAX_COURSES) throw new Error("North York catalog exceeds the verified-course budget.");
+    const specs = candidates.flatMap((c) => ["detail", "detail/buttonstatus"].map((path) => ({
+      url: `${ACTIVE_BASE}/rest/activity/${path}/${c.id}?`,
+      options: { headers: { Referer: `${ACTIVE_BASE}/activity/search/detail/${c.id}?onlineSiteId=0&from_original_cui=true` } }
+    })));
+    const verified = http.many(specs);
+    const rows = candidates.map((c, i) => parseNorthYorkCourse(
+      c,
+      json(verified[2 * i], "North York detail"),
+      json(verified[2 * i + 1], "North York enrollment status"),
+      today
+    )).filter(Boolean);
+    return { rows, pages: http.count, detail: `Complete Toronto catalog: ${catalog.total} activities; ${rows.length} North York exams verified.` };
+  }
+  function extractMontrealSettings(html) {
+    const base = /aec_app_url\s*=\s*["']([^"']+)/.exec(html)?.[1];
+    const key = /aecExtranetWebAppsAPIKey\s*=\s*["']([^"']+)/.exec(html)?.[1];
+    if (base && base.replace(/\/$/, "") !== MONTREAL_API || !key || key.length > 300) {
+      throw new Error("Montreal public registration settings changed.");
+    }
+    return key;
+  }
+  function montrealBooking(href, id) {
+    const url = new import_url_parse2.default(clean(href), MONTREAL_PAGE, true);
+    return url.protocol === "https:" && url.host === "www.afmontreal.ca" && !url.auth && url.pathname === "/panier/" && url.hash === `#/addExamination/${id}` && !Object.keys(url.query).length ? url.toString() : null;
+  }
+  function parseMontreal(data, today) {
+    if (!isoDate(today) || !Array.isArray(data) || data.length !== 1) throw new Error("Montreal returned an unexpected examination-type catalog.");
+    const type = object(data[0], "Montreal examination type");
+    if (type.IDEXAMINATION_TYPE !== 10 || clean(type.name).toLowerCase() !== "tcf canada" || !Array.isArray(type.examinations)) {
+      throw new Error("Montreal returned a different exam product or malformed catalog.");
+    }
+    if (type.examinations.length > 120) throw new Error("Montreal catalog exceeds the snapshot budget.");
+    const ids = /* @__PURE__ */ new Set();
+    return type.examinations.map((exam) => {
+      object(exam, "Montreal examination");
+      const id = integer(exam.IDEXAMINATION, "Montreal examination id", 1);
+      if (ids.has(id) || exam.IDEXAMINATION_TYPE !== 10 || clean(exam.product_name).toLowerCase() !== "tcf canada") {
+        throw new Error("Duplicate or mismatched Montreal examination identity.");
+      }
+      ids.add(id);
+      const date = isoDate(exam.examination_date);
+      const start = dayMonthYear(exam.formattedEnrollmentDate);
+      const end = dayMonthYear(exam.examination_enroll_end_date_formatted);
+      if (!date || !start || !end || start > end) throw new Error("Montreal examination or registration dates could not be validated.");
+      if (typeof exam.isFull !== "boolean" || typeof exam.inscriptionIsInFuture !== "boolean") throw new Error("Montreal registration flags changed.");
+      const qty = integer(exam.qty_student, "Montreal enrolled count");
+      const maximum = integer(exam.max_student, "Montreal capacity");
+      const register = object(exam.mainRegisterLink, "Montreal registration action");
+      const href = register.link ? montrealBooking(register.link, id) : null;
+      const blocked = clean(register.cantRegisterReason);
+      let available = false, reason = "no_active_booking_link";
+      if (exam.isFull || qty >= maximum) reason = "sold_out";
+      else if (blocked || exam.inscriptions_are_over === true || exam.inscriptions_started === false) reason = "registration_blocked";
+      else if (exam.inscriptionIsInFuture || today < start || today > end) reason = "outside_registration_window";
+      else if (date < today) reason = "past_exam";
+      else if (href && register.label === "add_to_cart") {
+        available = true;
+        reason = "verified_registration_action";
+      } else if (register.link) throw new Error("Montreal exposed an unrecognized or mismatched booking action.");
+      const time = clean(exam.examination_start_time_formatted);
+      return {
+        city: "Montreal",
+        priority: 3,
+        sourceId: id,
+        key: `montreal:examination:${id}`,
+        exam: "TCF Canada",
+        examDate: date,
+        schedule: `${date}${time && time !== "00:00" ? ` ${time}` : " (time to be confirmed)"}`,
+        registrationDates: `${start} to ${end} (Montreal local dates)`,
+        location: clean(exam.examination_location) || "Alliance Francaise Montreal",
+        spotsLeft: String(Math.max(0, maximum - qty)),
+        price: clean(exam.price_formatted || exam.price),
+        bookings: available ? "Active registration action" : blocked || reason,
+        links: available ? [href] : [],
+        pageUrl: MONTREAL_PAGE,
+        available,
+        reason
+      };
+    });
+  }
+  function fetchMontreal(request, { today, now = Date.now } = {}) {
+    const http = client(request, null, now);
+    const settings = http.one(MONTREAL_SETTINGS);
+    if (settings.status !== 200 || settings.body.length > 2e6) throw new Error(`Montreal settings: HTTP ${settings.status} or oversized response.`);
+    const key = extractMontrealSettings(settings.body);
+    const data = json(http.one(`${MONTREAL_API}/api/v1/public/examinations/list/0/10?API_KEY=${encodeURIComponent(key)}`), "Montreal examinations");
+    return { rows: parseMontreal(data, today), pages: http.count };
+  }
+  function preferredAlertBody(events, checkedAt) {
+    const ordered = [...events].sort((a, b) => a.priority - b.priority || a.examDate.localeCompare(b.examDate));
+    return [
+      "TCF Canada availability alert (Google-hosted monitor)",
+      "",
+      "Your centre preference: North York > Edmonton > Montreal",
+      `Checked at: ${checkedAt} (UTC)`,
+      "",
+      ...ordered.flatMap((row, index) => [
+        `${index + 1}. ${row.city}: ${row.exam}`,
+        `Exam date: ${row.schedule}`,
+        `Location: ${row.location}`,
+        `Registration: ${row.registrationDates}`,
+        `Spots: ${row.spotsLeft}`,
+        `Price: ${row.price}`,
+        `Official page: ${row.pageUrl}`,
+        `Booking link: ${row.links[0]}`,
+        ""
+      ]),
+      "The official registration system exposed an active booking action at check time. Seats may disappear before you click.",
+      "Check repeat-test eligibility and confirm the date and venue yourself. No seat has been reserved or paid for."
+    ].join("\n");
+  }
+
   // src/storage.js
-  var PREFIX = "EDMONTON_STATE_";
   function emptyState() {
     return { version: 1, seen: {}, recent: [], lastSuccess: null, failures: 0 };
   }
-  function loadState(properties2) {
-    const pointer = properties2.getProperty(`${PREFIX}ACTIVE`);
+  function loadState(properties, PREFIX = "EDMONTON_STATE_") {
+    const pointer = properties.getProperty(`${PREFIX}ACTIVE`);
     if (!pointer) return emptyState();
     const { bank, count } = JSON.parse(pointer);
     if (!["A", "B"].includes(bank) || !Number.isInteger(count) || count < 1 || count > 24) {
@@ -3392,7 +3741,7 @@ var EdmontonMonitor = (() => {
     }
     const parts = [];
     for (let i = 0; i < count; i += 1) {
-      const value = properties2.getProperty(`${PREFIX}${bank}_${i}`);
+      const value = properties.getProperty(`${PREFIX}${bank}_${i}`);
       if (value === null) throw new Error("Incomplete state; refusing to reset notification history.");
       parts.push(value);
     }
@@ -3400,18 +3749,18 @@ var EdmontonMonitor = (() => {
     if (state.version !== 1 || !state.seen || !Array.isArray(state.recent)) throw new Error("Unsupported state format.");
     return state;
   }
-  function saveState(properties2, state) {
-    const json = JSON.stringify(state).replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
-    const chunks = json.match(/[\s\S]{1,7500}/g);
-    if (chunks.length > 24) throw new Error("State exceeds its storage budget; preserving the previous state.");
-    const pointer = properties2.getProperty(`${PREFIX}ACTIVE`);
+  function saveState(properties, state, PREFIX = "EDMONTON_STATE_", maxChunks = 24) {
+    const json2 = JSON.stringify(state).replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    const chunks = json2.match(/[\s\S]{1,7500}/g);
+    if (chunks.length > maxChunks) throw new Error("State exceeds its storage budget; preserving the previous state.");
+    const pointer = properties.getProperty(`${PREFIX}ACTIVE`);
     const bank = pointer && JSON.parse(pointer).bank === "A" ? "B" : "A";
     const values = {};
     chunks.forEach((chunk, i) => {
       values[`${PREFIX}${bank}_${i}`] = chunk;
     });
-    properties2.setProperties(values, false);
-    properties2.setProperty(`${PREFIX}ACTIVE`, JSON.stringify({ bank, count: chunks.length }));
+    properties.setProperties(values, false);
+    properties.setProperty(`${PREFIX}ACTIVE`, JSON.stringify({ bank, count: chunks.length }));
   }
   function summarize(state, now = Date.now()) {
     const cutoff = now - 864e5;
@@ -3432,304 +3781,507 @@ var EdmontonMonitor = (() => {
     };
   }
 
-  // src/apps-script.js
-  var CHECK_HEADERS = [
-    "Checked at (UTC)",
-    "Mode",
-    "Outcome",
-    "Runtime seconds",
-    "Gap since success (minutes)",
-    "Pages",
-    "TCF Canada rows",
-    "Available rows",
-    "Alerted rows",
-    "Details",
-    "Full schedule snapshot (JSON)"
-  ];
-  var MANAGED_HANDLERS = ["checkEdmonton", "sendDailyReport"];
-  function properties() {
-    return PropertiesService.getScriptProperties();
-  }
-  function config() {
-    const p = properties();
-    const recipient = p.getProperty("TCF_ALERT_EMAIL_TO") || "qordmlwls@gmail.com";
-    if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(recipient)) throw new Error("Configure one valid TCF_ALERT_EMAIL_TO address.");
-    const heartbeat = p.getProperty("TCF_HEALTHCHECKS_URL") || "";
-    if (heartbeat && !/^https:\/\/hc-ping\.com\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(heartbeat)) {
-      throw new Error("TCF_HEALTHCHECKS_URL must be the private https://hc-ping.com/<uuid> URL.");
-    }
-    return { recipient, heartbeat, spreadsheetId: p.getProperty("TCF_LOG_SPREADSHEET_ID") };
-  }
-  function logSheet() {
-    const id = config().spreadsheetId;
-    if (!id) throw new Error("Run installPilot first to create the monitoring log.");
-    const sheet = SpreadsheetApp.openById(id).getSheetByName("Checks");
-    if (!sheet || sheet.getRange(1, 1, 1, CHECK_HEADERS.length).getValues()[0].join("|") !== CHECK_HEADERS.join("|")) {
-      throw new Error("Monitoring log headers changed; restore the Checks sheet headers.");
-    }
-    return sheet;
-  }
-  function ensureLog() {
-    if (config().spreadsheetId) return logSheet();
-    const book = SpreadsheetApp.create("TCF Edmonton Monitor - Check History");
-    const sheet = book.getSheets()[0];
-    sheet.setName("Checks");
-    sheet.getRange(1, 1, 1, CHECK_HEADERS.length).setValues([CHECK_HEADERS]);
-    sheet.setFrozenRows(1);
-    properties().setProperty("TCF_LOG_SPREADSHEET_ID", book.getId());
-    return sheet;
-  }
-  function appendCheck(sheet, result) {
-    const snapshot = JSON.stringify(result.snapshot || []);
-    if (snapshot.length > 45e3) throw new Error("Full snapshot exceeds the log-cell size budget.");
-    const row = [
-      result.checkedAt,
-      result.mode,
-      result.outcome,
-      Math.round(result.durationMs / 100) / 10,
-      result.gapMs === null ? "" : Math.round(result.gapMs / 6e3) / 10,
-      result.pages || 0,
-      result.snapshot?.length || 0,
-      result.snapshot?.filter((r) => r.available).length || 0,
-      result.alerted || 0,
-      result.details || "",
-      snapshot
+  // src/runtime.js
+  function createMonitorRuntime(profile) {
+    const PAGE_URL2 = profile.pageUrl;
+    const INTERVAL_MINUTES = 5;
+    const CHECK_HEADERS = [
+      "Checked at (UTC)",
+      "Mode",
+      "Outcome",
+      "Runtime seconds",
+      "Gap since success (minutes)",
+      "Pages",
+      "TCF Canada rows",
+      "Available rows",
+      "Alerted rows",
+      "Details",
+      "Full schedule snapshot (JSON)"
     ];
-    sheet.appendRow(row.map((value) => typeof value === "string" && /^[=+@-]/.test(value) ? `'${value}` : value));
-    if (sheet.getLastRow() > 10001) sheet.deleteRows(2, sheet.getLastRow() - 10001);
-  }
-  function requestPage(url) {
-    const response = UrlFetchApp.fetch(url, {
-      method: "get",
-      followRedirects: false,
-      muteHttpExceptions: true,
-      validateHttpsCertificates: true,
-      headers: { "Cache-Control": "no-cache", "User-Agent": "TCF-Availability-Monitor/2.0 (public schedule checker; no automated registration)" }
-    });
-    const headers = response.getAllHeaders();
-    const typeKey = Object.keys(headers).find((key) => key.toLowerCase() === "content-type");
-    return { status: response.getResponseCode(), contentType: typeKey ? String(headers[typeKey]) : "", body: response.getContentText() };
-  }
-  function edmontonWallTime(date) {
-    return Date.parse(`${Utilities.formatDate(date, "America/Edmonton", "yyyy-MM-dd'T'HH:mm:ss")}Z`);
-  }
-  function send(subject, body, reserve = 0) {
-    if (MailApp.getRemainingDailyQuota() <= reserve) throw new Error("Google email quota is too low; pending seat alerts have not been marked sent.");
-    MailApp.sendEmail({ to: config().recipient, subject, body, name: "TCF Edmonton Monitor" });
-  }
-  function safeError(error) {
-    return String(error.message || error).replace(/https:\/\/hc-ping\.com\/[^\s)]+/g, "[private heartbeat URL]").slice(0, 1500);
-  }
-  function pingHeartbeat() {
-    const url = config().heartbeat;
-    if (!url) return "NOT_CONFIGURED";
-    try {
-      const response = UrlFetchApp.fetch(url, {
-        method: "post",
-        payload: "Edmonton complete check and alert processing succeeded.",
+    const MANAGED_HANDLERS = [profile.checkHandler, profile.reportHandler];
+    const key = (suffix) => `${profile.propertyPrefix}${suffix}`;
+    const readState = () => loadState(properties(), profile.statePrefix);
+    const writeState = (state) => saveState(properties(), state, profile.statePrefix, profile.maxChunks || 8);
+    function properties() {
+      return PropertiesService.getScriptProperties();
+    }
+    function recentChecks(checks) {
+      return checks.filter((check2) => check2.at >= Date.now() - 864e5).slice(-650);
+    }
+    function config() {
+      const p = properties();
+      const recipient = p.getProperty("TCF_ALERT_EMAIL_TO") || "qordmlwls@gmail.com";
+      if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(recipient)) throw new Error("Configure one valid TCF_ALERT_EMAIL_TO address.");
+      const heartbeat = p.getProperty(key("HEALTHCHECKS_URL")) || "";
+      if (heartbeat && !/^https:\/\/hc-ping\.com\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(heartbeat)) {
+        throw new Error(`${key("HEALTHCHECKS_URL")} must be the private https://hc-ping.com/<uuid> URL.`);
+      }
+      return { recipient, heartbeat, spreadsheetId: p.getProperty(key("LOG_SPREADSHEET_ID")) };
+    }
+    function logSheet() {
+      const id = config().spreadsheetId;
+      if (!id) throw new Error("Run installPilot first to create the monitoring log.");
+      const sheet = SpreadsheetApp.openById(id).getSheetByName(profile.sheetName);
+      if (!sheet || sheet.getRange(1, 1, 1, CHECK_HEADERS.length).getValues()[0].join("|") !== CHECK_HEADERS.join("|")) {
+        throw new Error("Monitoring log headers changed; restore the Checks sheet headers.");
+      }
+      return sheet;
+    }
+    function ensureLog() {
+      if (config().spreadsheetId) return logSheet();
+      const sharedId = properties().getProperty("TCF_LOG_SPREADSHEET_ID");
+      const book = sharedId ? SpreadsheetApp.openById(sharedId) : SpreadsheetApp.create("TCF Canada Monitor - Check History");
+      const existing = sharedId ? book.getSheetByName(profile.sheetName) : null;
+      if (existing) {
+        properties().setProperty(key("LOG_SPREADSHEET_ID"), book.getId());
+        return logSheet();
+      }
+      const sheet = sharedId ? book.insertSheet(profile.sheetName) : book.getSheets()[0];
+      sheet.setName(profile.sheetName);
+      sheet.getRange(1, 1, 1, CHECK_HEADERS.length).setValues([CHECK_HEADERS]);
+      sheet.setFrozenRows(1);
+      properties().setProperty(key("LOG_SPREADSHEET_ID"), book.getId());
+      return sheet;
+    }
+    function appendCheck(sheet, result) {
+      const snapshot = JSON.stringify(result.snapshot || []);
+      if (snapshot.length > 45e3) throw new Error("Full snapshot exceeds the log-cell size budget.");
+      const row = [
+        result.checkedAt,
+        result.mode,
+        result.outcome,
+        Math.round(result.durationMs / 100) / 10,
+        result.gapMs === null ? "" : Math.round(result.gapMs / 6e3) / 10,
+        result.pages || 0,
+        result.snapshot?.length || 0,
+        result.snapshot?.filter((r) => r.available).length || 0,
+        result.alerted || 0,
+        result.details || "",
+        snapshot
+      ];
+      sheet.appendRow(row.map((value) => typeof value === "string" && /^[=+@-]/.test(value) ? `'${value}` : value));
+      if (sheet.getLastRow() > 10001) sheet.deleteRows(2, sheet.getLastRow() - 10001);
+    }
+    function requestOptions(options = {}) {
+      return {
+        method: "get",
         followRedirects: false,
         muteHttpExceptions: true,
-        validateHttpsCertificates: true
-      });
-      if (response.getResponseCode() !== 200) throw new Error("Heartbeat service returned a non-200 response.");
-      return "OK";
-    } catch (_) {
-      console.error("Heartbeat delivery failed; external health status may show DOWN.");
-      return "FAILED";
+        validateHttpsCertificates: true,
+        ...options,
+        headers: { "Cache-Control": "no-cache", "User-Agent": "TCF-Availability-Monitor/3.0 (public schedule checker; no automated registration)", ...options.headers }
+      };
     }
-  }
-  function healthWarning(body) {
-    const p = properties();
-    const last = Number(p.getProperty("TCF_LAST_HEALTH_WARNING_MS") || 0);
-    if (Date.now() - last < 6 * 36e5) return;
-    try {
-      send("[TCF Edmonton health] Monitoring needs attention", `${body}
+    function responseData(response) {
+      const headers = response.getAllHeaders();
+      const typeKey = Object.keys(headers).find((key2) => key2.toLowerCase() === "content-type");
+      return { status: response.getResponseCode(), contentType: typeKey ? String(headers[typeKey]) : "", body: response.getContentText() };
+    }
+    function requestPage(url, options) {
+      return responseData(UrlFetchApp.fetch(url, requestOptions(options)));
+    }
+    function requestBatch(specs) {
+      return UrlFetchApp.fetchAll(specs.map((spec) => ({ url: spec.url, ...requestOptions(spec.options) }))).map(responseData);
+    }
+    function edmontonWallTime(date) {
+      return Date.parse(`${Utilities.formatDate(date, profile.timezone, "yyyy-MM-dd'T'HH:mm:ss")}Z`);
+    }
+    function send(subject, body, reserve = 0) {
+      if (MailApp.getRemainingDailyQuota() <= reserve) throw new Error("Google email quota is too low; pending seat alerts have not been marked sent.");
+      MailApp.sendEmail({ to: config().recipient, subject, body, name: `TCF ${profile.label} Monitor` });
+    }
+    function safeError(error) {
+      return String(error.message || error).replace(/https:\/\/hc-ping\.com\/[^\s)]+/g, "[private heartbeat URL]").replace(/([?&]API_KEY=)[^\s&]+/gi, "$1[public key omitted]").slice(0, 1500);
+    }
+    function pingHeartbeat() {
+      const url = config().heartbeat;
+      if (!url) return "NOT_CONFIGURED";
+      try {
+        const response = UrlFetchApp.fetch(url, {
+          method: "post",
+          payload: `${profile.label} complete check and alert processing succeeded.`,
+          followRedirects: false,
+          muteHttpExceptions: true,
+          validateHttpsCertificates: true
+        });
+        if (response.getResponseCode() !== 200) throw new Error("Heartbeat service returned a non-200 response.");
+        return "OK";
+      } catch (_) {
+        console.error("Heartbeat delivery failed; external health status may show DOWN.");
+        return "FAILED";
+      }
+    }
+    function healthWarning(body) {
+      const p = properties();
+      const last = Number(p.getProperty(key("LAST_HEALTH_WARNING_MS")) || 0);
+      if (Date.now() - last < 6 * 36e5) return;
+      try {
+        send(`[TCF ${profile.label} health] Monitoring needs attention`, `${body}
 
 This is a monitoring warning, not a seat-availability alert.
 ${statusText()}`, 5);
-      p.setProperty("TCF_LAST_HEALTH_WARNING_MS", String(Date.now()));
-    } catch (error) {
-      console.error(`Health email could not be sent: ${safeError(error)}`);
-    }
-  }
-  function runCheck(dryRun2) {
-    const started = Date.now();
-    const lock = LockService.getScriptLock();
-    if (!lock.tryLock(1e3)) {
-      console.warn("Skipped overlapping check; this is not a successful observation.");
-      return { outcome: "SKIPPED_OVERLAP" };
-    }
-    let state, sheet, result;
-    let recorded = false;
-    try {
-      config();
-      sheet = logSheet();
-      state = loadState(properties());
-      const fetched = fetchComplete(requestPage);
-      const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
-      const assessment = evaluate(fetched.rows, state.seen, checkedAt, edmontonWallTime(new Date(checkedAt)));
-      result = {
-        checkedAt,
-        mode: dryRun2 ? "DRY_RUN" : "CHECK",
-        outcome: "SUCCESS",
-        pages: fetched.pages,
-        snapshot: assessment.snapshot,
-        alerted: 0,
-        durationMs: Date.now() - started,
-        gapMs: state.lastSuccess ? Date.parse(checkedAt) - Date.parse(state.lastSuccess) : null
-      };
-      if (dryRun2) {
-        result.details = `${assessment.events.length} potential alerts. No email, state change, or heartbeat.`;
-        appendCheck(sheet, result);
-        console.log(JSON.stringify(result));
-        return result;
-      }
-      state.seen = assessment.next;
-      if (assessment.events.length) {
-        saveState(properties(), state);
-        send(`[TCF Edmonton] ${assessment.events.length} bookable session(s) - Apps Script`, alertBody(assessment.events, checkedAt));
-        markSent(state.seen, assessment.events);
-        saveState(properties(), state);
-        result.alerted = assessment.events.length;
-      }
-      result.details = config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED.";
-      result.durationMs = Date.now() - started;
-      appendCheck(sheet, { ...result, outcome: "OBSERVED" });
-      const previousFailures = state.failures;
-      const completed = {
-        ...state,
-        lastSuccess: checkedAt,
-        failures: 0,
-        lastRowCount: fetched.rows.length,
-        lastAvailableCount: assessment.snapshot.filter((row) => row.available).length,
-        recent: [...state.recent, { at: Date.parse(checkedAt), ok: true, durationMs: Date.now() - started, gapMs: result.gapMs }].slice(-650)
-      };
-      saveState(properties(), completed);
-      state = completed;
-      recorded = true;
-      const heartbeat = pingHeartbeat();
-      try {
-        properties().setProperty("TCF_LAST_HEARTBEAT_STATUS", heartbeat);
-        sheet.getRange(sheet.getLastRow(), 3).setValue("SUCCESS");
-        sheet.getRange(sheet.getLastRow(), 4).setValue(Math.round((Date.now() - started) / 100) / 10);
-        sheet.getRange(sheet.getLastRow(), 10).setValue(`Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}.`);
+        p.setProperty(key("LAST_HEALTH_WARNING_MS"), String(Date.now()));
       } catch (error) {
-        console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`);
+        console.error(`Health email could not be sent: ${safeError(error)}`);
       }
-      console.log(JSON.stringify({ ...result, snapshot: void 0, heartbeat, durationMs: Date.now() - started }));
-      if (heartbeat === "FAILED" || (result.gapMs || 0) > 15 * 6e4 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 60) {
-        healthWarning(`Latest check succeeded. Previous gap: ${Math.round((result.gapMs || 0) / 6e4)} minutes. Heartbeat: ${heartbeat}.`);
-      }
-      return { ...result, heartbeat };
-    } catch (error) {
-      const message = safeError(error);
-      console.error(message);
-      if (!dryRun2 && state && !recorded) {
-        state.failures += 1;
-        state.recent.push({ at: Date.now(), ok: false, durationMs: Date.now() - started });
-        state.recent = state.recent.slice(-650);
-        try {
-          saveState(properties(), state);
-        } catch (saveError) {
-          console.error(safeError(saveError));
-        }
-      }
-      try {
-        if (sheet) appendCheck(sheet, {
-          ...result,
-          checkedAt: (/* @__PURE__ */ new Date()).toISOString(),
-          mode: dryRun2 ? "DRY_RUN" : "CHECK",
-          outcome: "FAILED",
-          durationMs: Date.now() - started,
-          gapMs: null,
-          details: message
-        });
-      } catch (logError) {
-        console.error(`Failed to record check: ${safeError(logError)}`);
-      }
-      if (!dryRun2 && (!state || state.failures >= 3 || !state.lastSuccess || Date.now() - Date.parse(state.lastSuccess) > 15 * 6e4)) healthWarning(message);
-      throw new Error(message);
-    } finally {
-      lock.releaseLock();
     }
+    function runCheck(dryRun3) {
+      const started = Date.now();
+      const lock = LockService.getScriptLock();
+      if (!lock.tryLock(1e3)) {
+        console.warn("Skipped overlapping check; this is not a successful observation.");
+        return { outcome: "SKIPPED_OVERLAP" };
+      }
+      let state, sheet, result;
+      let recorded = false;
+      try {
+        config();
+        sheet = logSheet();
+        state = readState();
+        const fetched = profile.fetch(requestPage, { seen: state.seen, today: Utilities.formatDate(/* @__PURE__ */ new Date(), profile.timezone, "yyyy-MM-dd") }, requestBatch);
+        const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
+        const assessment = profile.evaluate(fetched.rows, state.seen, checkedAt, edmontonWallTime(new Date(checkedAt)));
+        result = {
+          checkedAt,
+          mode: dryRun3 ? "DRY_RUN" : "CHECK",
+          outcome: "SUCCESS",
+          pages: fetched.pages,
+          snapshot: assessment.snapshot,
+          alerted: 0,
+          durationMs: Date.now() - started,
+          gapMs: state.lastSuccess ? Date.parse(checkedAt) - Date.parse(state.lastSuccess) : null
+        };
+        if (dryRun3) {
+          result.details = `${assessment.events.length} potential alerts. No email, state change, or heartbeat.`;
+          appendCheck(sheet, result);
+          console.log(JSON.stringify({
+            ...result,
+            snapshot: void 0,
+            rows: result.snapshot.length,
+            available: result.snapshot.filter((row) => row.available).length,
+            note: "Full snapshot saved in the check-history sheet."
+          }));
+          return result;
+        }
+        state.seen = assessment.next;
+        if (assessment.events.length) {
+          writeState(state);
+          send(`[TCF ${profile.label}] ${assessment.events.length} bookable session(s) - Apps Script`, profile.alertBody(assessment.events, checkedAt));
+          markSent(state.seen, assessment.events);
+          writeState(state);
+          result.alerted = assessment.events.length;
+        }
+        result.details = config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED.";
+        result.durationMs = Date.now() - started;
+        appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+        const previousFailures = state.failures;
+        const completed = {
+          ...state,
+          lastSuccess: checkedAt,
+          failures: 0,
+          lastRowCount: fetched.rows.length,
+          lastAvailableCount: assessment.snapshot.filter((row) => row.available).length,
+          recent: recentChecks([...state.recent, { at: Date.parse(checkedAt), ok: true, durationMs: Date.now() - started, gapMs: result.gapMs }])
+        };
+        writeState(completed);
+        state = completed;
+        recorded = true;
+        const heartbeat = pingHeartbeat();
+        try {
+          properties().setProperty(key("LAST_HEARTBEAT_STATUS"), heartbeat);
+          sheet.getRange(sheet.getLastRow(), 3).setValue("SUCCESS");
+          sheet.getRange(sheet.getLastRow(), 4).setValue(Math.round((Date.now() - started) / 100) / 10);
+          sheet.getRange(sheet.getLastRow(), 10).setValue(`Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`);
+        } catch (error) {
+          console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`);
+        }
+        console.log(JSON.stringify({ ...result, snapshot: void 0, heartbeat, durationMs: Date.now() - started }));
+        if (heartbeat === "FAILED" || (result.gapMs || 0) > 15 * 6e4 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
+          healthWarning(`Latest check succeeded. Previous gap: ${Math.round((result.gapMs || 0) / 6e4)} minutes. Heartbeat: ${heartbeat}.`);
+        }
+        return { ...result, heartbeat };
+      } catch (error) {
+        const message = safeError(error);
+        console.error(message);
+        if (!dryRun3 && state && !recorded) {
+          state.failures += 1;
+          state.recent.push({ at: Date.now(), ok: false, durationMs: Date.now() - started });
+          state.recent = recentChecks(state.recent);
+          try {
+            writeState(state);
+          } catch (saveError) {
+            console.error(safeError(saveError));
+          }
+        }
+        try {
+          if (sheet) appendCheck(sheet, {
+            ...result,
+            checkedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            mode: dryRun3 ? "DRY_RUN" : "CHECK",
+            outcome: "FAILED",
+            durationMs: Date.now() - started,
+            gapMs: null,
+            details: message
+          });
+        } catch (logError) {
+          console.error(`Failed to record check: ${safeError(logError)}`);
+        }
+        if (!dryRun3 && (!state || state.failures >= 3 || !state.lastSuccess || Date.now() - Date.parse(state.lastSuccess) > 15 * 6e4)) healthWarning(message);
+        throw new Error(message);
+      } finally {
+        lock.releaseLock();
+      }
+    }
+    function check() {
+      return runCheck(false);
+    }
+    function dryRun2() {
+      ensureLog();
+      return runCheck(true);
+    }
+    function testAlert2() {
+      send(`[TCF ${profile.label} TEST] Apps Script email delivery`, `This is a test of the Google-hosted ${profile.label} monitor.
+No available seat has been detected or reserved.
+
+Running this test does not start scheduled monitoring.`);
+      console.log("Google accepted the test email. Confirm it arrived in your inbox.");
+    }
+    function statusText() {
+      const state = readState();
+      const stats = summarize(state);
+      const c = config();
+      const enabled = ScriptApp.getProjectTriggers().filter((t) => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
+      return [
+        `TCF ${profile.label} monitor health (not a seat alert)`,
+        "",
+        `Five-minute check triggers: ${enabled} (expected 1)`,
+        `Last successful check (UTC): ${stats.lastSuccess || "NONE"}`,
+        `Minutes since success: ${stats.minutesSinceSuccess ?? "UNKNOWN"}`,
+        `Successful checks in last 24 hours: ${stats.successfulChecks24h} (288 expected after a full day)`,
+        `Failed checks in last 24 hours: ${stats.failedChecks24h}`,
+        `Longest observed gap in last 24 hours: ${stats.longestGapMinutes24h} minutes`,
+        `Measured check runtime in last 24 hours: ${stats.measuredRuntimeMinutes24h} minutes`,
+        `Average check runtime: ${stats.averageRuntimeSeconds24h ?? "UNKNOWN"} seconds`,
+        "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
+        `Last session count: ${state.lastRowCount ?? "UNKNOWN"}; available: ${state.lastAvailableCount ?? "UNKNOWN"}`,
+        `External watchdog: ${c.heartbeat ? `configured; last delivery ${properties().getProperty(key("LAST_HEARTBEAT_STATUS")) || "NOT YET TESTED"}` : "NOT CONFIGURED - a stopped script cannot warn you"}`,
+        `Check history: ${c.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${c.spreadsheetId}/edit` : "NOT CREATED"}`,
+        "",
+        "A successful check describes one observation, not guaranteed continuous coverage.",
+        PAGE_URL2
+      ].join("\n");
+    }
+    function showStatus2() {
+      const status = statusText();
+      console.log(status);
+      return status;
+    }
+    function sendDailyReport2() {
+      send(`[TCF ${profile.label} health] Daily monitoring report`, statusText(), 5);
+    }
+    function installPilot2() {
+      config();
+      ensureLog();
+      dryRun2();
+      const existing = ScriptApp.getProjectTriggers().filter((t) => MANAGED_HANDLERS.includes(t.getHandlerFunction()));
+      const created = [];
+      try {
+        created.push(ScriptApp.newTrigger(profile.checkHandler).timeBased().everyMinutes(INTERVAL_MINUTES).create());
+        created.push(ScriptApp.newTrigger(profile.reportHandler).timeBased().atHour(18).everyDays(1).inTimezone("America/Edmonton").create());
+      } catch (error) {
+        created.forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+        throw error;
+      }
+      existing.forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+      properties().setProperty(key("PILOT_INSTALLED_AT"), (/* @__PURE__ */ new Date()).toISOString());
+      check();
+      send(`[TCF ${profile.label} health] Five-minute pilot installed`, statusText(), 5);
+      return showStatus2();
+    }
+    function stopPilot2() {
+      ScriptApp.getProjectTriggers().filter((t) => MANAGED_HANDLERS.includes(t.getHandlerFunction())).forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+      console.log("Apps Script pilot stopped. History and notification state were preserved. GitHub Actions was not changed. The external watchdog will alert unless paused separately.");
+    }
+    function testWatchdogFailure2() {
+      const url = config().heartbeat;
+      if (!url) throw new Error(`Configure ${key("HEALTHCHECKS_URL")} before testing the independent warning.`);
+      const response = UrlFetchApp.fetch(`${url}/fail`, { method: "post", payload: "Intentional watchdog notification test.", muteHttpExceptions: true, followRedirects: false });
+      if (response.getResponseCode() !== 200) throw new Error("Watchdog test could not be delivered.");
+      console.log("Intentional DOWN signal sent. Verify the external warning email; the next successful scheduled check restores UP.");
+    }
+    return {
+      check,
+      dryRun: dryRun2,
+      testAlert: testAlert2,
+      showStatus: showStatus2,
+      statusText,
+      sendDailyReport: sendDailyReport2,
+      installPilot: installPilot2,
+      stopPilot: stopPilot2,
+      testWatchdogFailure: testWatchdogFailure2,
+      ensureLog,
+      summary: () => summarize(readState()),
+      send,
+      config,
+      healthWarning
+    };
   }
+
+  // src/apps-script.js
+  var edmonton = createMonitorRuntime({
+    label: "Edmonton",
+    pageUrl: PAGE_URL,
+    propertyPrefix: "TCF_",
+    statePrefix: "EDMONTON_STATE_",
+    sheetName: "Checks",
+    timezone: "America/Edmonton",
+    maxChunks: 12,
+    checkHandler: "checkEdmonton",
+    reportHandler: "sendDailyReport",
+    fetch: (request) => fetchComplete(request),
+    evaluate,
+    alertBody
+  });
+  var northYork = createMonitorRuntime({
+    label: "North York",
+    pageUrl: NORTH_YORK_PAGE,
+    propertyPrefix: "TCF_NORTH_YORK_",
+    statePrefix: "NORTH_YORK_STATE_",
+    sheetName: "North York",
+    timezone: "America/Toronto",
+    maxChunks: 10,
+    checkHandler: "checkNorthYork",
+    reportHandler: "sendNorthYorkReport",
+    fetch: fetchNorthYork,
+    evaluate: evaluateSnapshot,
+    alertBody: preferredAlertBody
+  });
+  var montreal = createMonitorRuntime({
+    label: "Montreal",
+    pageUrl: MONTREAL_PAGE,
+    propertyPrefix: "TCF_MONTREAL_",
+    statePrefix: "MONTREAL_STATE_",
+    sheetName: "Montreal",
+    timezone: "America/Toronto",
+    checkHandler: "checkMontreal",
+    reportHandler: "sendMontrealReport",
+    fetch: fetchMontreal,
+    evaluate: evaluateSnapshot,
+    alertBody: preferredAlertBody
+  });
+  var preference = [["North York", northYork], ["Edmonton", edmonton], ["Montreal", montreal]];
+  var allHandlers = ["checkAllCities", "sendAllDailyReport", "checkEdmonton", "sendDailyReport"];
+  var hasAllTrigger = () => ScriptApp.getProjectTriggers().some((t) => t.getHandlerFunction() === "checkAllCities");
   function checkEdmonton() {
-    return runCheck(false);
+    return edmonton.check();
   }
   function dryRun() {
-    ensureLog();
-    return runCheck(true);
+    return edmonton.dryRun();
   }
   function testAlert() {
-    send("[TCF Edmonton TEST] Apps Script email delivery", "This is a test of the Google-hosted Edmonton monitor.\nNo available seat has been detected or reserved.\n\nRunning this test does not start scheduled monitoring.");
-    console.log("Google accepted the test email. Confirm it arrived in your inbox.");
-  }
-  function statusText() {
-    const state = loadState(properties());
-    const stats = summarize(state);
-    const c = config();
-    const enabled = ScriptApp.getProjectTriggers().filter((t) => t.getHandlerFunction() === "checkEdmonton").length;
-    return [
-      "TCF Edmonton monitor health (not a seat alert)",
-      "",
-      `Five-minute check triggers: ${enabled} (expected 1)`,
-      `Last successful check (UTC): ${stats.lastSuccess || "NONE"}`,
-      `Minutes since success: ${stats.minutesSinceSuccess ?? "UNKNOWN"}`,
-      `Successful checks in last 24 hours: ${stats.successfulChecks24h} (288 expected after a full day)`,
-      `Failed checks in last 24 hours: ${stats.failedChecks24h}`,
-      `Longest observed gap in last 24 hours: ${stats.longestGapMinutes24h} minutes`,
-      `Measured check runtime in last 24 hours: ${stats.measuredRuntimeMinutes24h} minutes`,
-      `Average check runtime: ${stats.averageRuntimeSeconds24h ?? "UNKNOWN"} seconds`,
-      "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
-      `Last session count: ${state.lastRowCount ?? "UNKNOWN"}; available: ${state.lastAvailableCount ?? "UNKNOWN"}`,
-      `External watchdog: ${c.heartbeat ? `configured; last delivery ${properties().getProperty("TCF_LAST_HEARTBEAT_STATUS") || "NOT YET TESTED"}` : "NOT CONFIGURED - a stopped script cannot warn you"}`,
-      `Check history: ${c.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${c.spreadsheetId}/edit` : "NOT CREATED"}`,
-      "",
-      "A successful check describes one observation, not guaranteed continuous coverage.",
-      PAGE_URL
-    ].join("\n");
+    return edmonton.testAlert();
   }
   function showStatus() {
-    const status = statusText();
-    console.log(status);
-    return status;
+    return edmonton.showStatus();
   }
   function sendDailyReport() {
-    send("[TCF Edmonton health] Daily monitoring report", statusText(), 5);
-  }
-  function installPilot() {
-    config();
-    ensureLog();
-    dryRun();
-    const existing = ScriptApp.getProjectTriggers().filter((t) => MANAGED_HANDLERS.includes(t.getHandlerFunction()));
-    const created = [];
-    try {
-      created.push(ScriptApp.newTrigger("checkEdmonton").timeBased().everyMinutes(INTERVAL_MINUTES).create());
-      created.push(ScriptApp.newTrigger("sendDailyReport").timeBased().atHour(18).everyDays(1).inTimezone("America/Edmonton").create());
-    } catch (error) {
-      created.forEach((trigger) => ScriptApp.deleteTrigger(trigger));
-      throw error;
-    }
-    existing.forEach((trigger) => ScriptApp.deleteTrigger(trigger));
-    properties().setProperty("TCF_PILOT_INSTALLED_AT", (/* @__PURE__ */ new Date()).toISOString());
-    checkEdmonton();
-    send("[TCF Edmonton health] Five-minute pilot installed", statusText(), 5);
-    return showStatus();
-  }
-  function stopPilot() {
-    ScriptApp.getProjectTriggers().filter((t) => MANAGED_HANDLERS.includes(t.getHandlerFunction())).forEach((trigger) => ScriptApp.deleteTrigger(trigger));
-    console.log("Apps Script pilot stopped. History and notification state were preserved. GitHub Actions was not changed. The external watchdog will alert unless paused separately.");
+    return edmonton.sendDailyReport();
   }
   function testWatchdogFailure() {
-    const url = config().heartbeat;
-    if (!url) throw new Error("Configure TCF_HEALTHCHECKS_URL before testing the independent warning.");
-    const response = UrlFetchApp.fetch(`${url}/fail`, { method: "post", payload: "Intentional watchdog notification test.", muteHttpExceptions: true, followRedirects: false });
-    if (response.getResponseCode() !== 200) throw new Error("Watchdog test could not be delivered.");
-    console.log("Intentional DOWN signal sent. Verify the external warning email; the next successful scheduled check restores UP.");
+    return edmonton.testWatchdogFailure();
+  }
+  function installPilot() {
+    return hasAllTrigger() ? installAllCities() : edmonton.installPilot();
+  }
+  function stopPilot() {
+    return hasAllTrigger() ? stopAllCities() : edmonton.stopPilot();
+  }
+  function dryRunNorthYork() {
+    return northYork.dryRun();
+  }
+  function dryRunMontreal() {
+    return montreal.dryRun();
+  }
+  function testNorthYorkWatchdog() {
+    return northYork.testWatchdogFailure();
+  }
+  function testMontrealWatchdog() {
+    return montreal.testWatchdogFailure();
+  }
+  function dryRunAllCities() {
+    edmonton.ensureLog();
+    return preference.map(([city, monitor]) => ({ city, ...monitor.dryRun() }));
+  }
+  function checkAllCities() {
+    const results = [], errors = [];
+    for (const [city, monitor] of [["Edmonton", edmonton], ["North York", northYork], ["Montreal", montreal]]) {
+      try {
+        results.push({ city, ...monitor.check() });
+      } catch (error) {
+        errors.push(`${city}: ${error.message}`);
+      }
+    }
+    console.log(JSON.stringify(results.map(({ city, checkedAt, outcome, heartbeat, alerted }) => ({ city, checkedAt, outcome, heartbeat, alerted }))));
+    try {
+      const totalMinutes = preference.reduce((sum, [, monitor]) => sum + monitor.summary().measuredRuntimeMinutes24h, 0);
+      if (totalMinutes > 60) edmonton.healthWarning(`Combined measured runtime: ${totalMinutes.toFixed(1)} minutes in 24 hours. All scripts share Google's daily runtime quota; review frequency.`);
+    } catch (error) {
+      errors.push(`Combined health report: ${error.message}`);
+    }
+    if (errors.length) throw new Error(`Some cities could not be checked; other cities were still processed. ${errors.join(" | ")}`);
+    return results;
+  }
+  function allStatusText() {
+    return [
+      "TCF Canada preferred-centre monitoring",
+      "Preference: North York > Edmonton > Montreal",
+      ...preference.map(([, monitor]) => monitor.statusText()),
+      "All cities share the same Google account quotas. Check combined runtime, not only each city separately."
+    ].join("\n\n");
+  }
+  function showAllStatus() {
+    const text = allStatusText();
+    console.log(text);
+    return text;
+  }
+  function sendAllDailyReport() {
+    edmonton.send("[TCF health] North York, Edmonton, Montreal daily report", allStatusText(), 5);
+  }
+  function installAllCities() {
+    const validation = dryRunAllCities();
+    if (validation.some((result) => result.outcome !== "SUCCESS")) throw new Error("All cities must pass validation before replacing the existing schedule. Try again when no check is running.");
+    const old = ScriptApp.getProjectTriggers().filter((t) => allHandlers.includes(t.getHandlerFunction()));
+    const created = [];
+    try {
+      created.push(ScriptApp.newTrigger("checkAllCities").timeBased().everyMinutes(5).create());
+      created.push(ScriptApp.newTrigger("sendAllDailyReport").timeBased().atHour(18).everyDays(1).inTimezone("America/Edmonton").create());
+    } catch (error) {
+      created.forEach((t) => ScriptApp.deleteTrigger(t));
+      throw error;
+    }
+    old.forEach((t) => ScriptApp.deleteTrigger(t));
+    PropertiesService.getScriptProperties().setProperty("TCF_ALL_CITIES_INSTALLED_AT", (/* @__PURE__ */ new Date()).toISOString());
+    checkAllCities();
+    edmonton.send("[TCF health] Three-centre five-minute monitor installed", allStatusText(), 5);
+    return showAllStatus();
+  }
+  function stopAllCities() {
+    ScriptApp.getProjectTriggers().filter((t) => allHandlers.includes(t.getHandlerFunction())).forEach((t) => ScriptApp.deleteTrigger(t));
+    console.log("Google-hosted monitoring stopped. History and GitHub monitoring were preserved. Independent watchdogs remain active.");
   }
   return __toCommonJS(apps_script_exports);
 })();
 
+function installAllCities() { return EdmontonMonitor.installAllCities(); }
+function dryRunAllCities() { return EdmontonMonitor.dryRunAllCities(); }
+function checkAllCities() { return EdmontonMonitor.checkAllCities(); }
+function showAllStatus() { return EdmontonMonitor.showAllStatus(); }
+function sendAllDailyReport() { return EdmontonMonitor.sendAllDailyReport(); }
+function stopAllCities() { return EdmontonMonitor.stopAllCities(); }
+function dryRunNorthYork() { return EdmontonMonitor.dryRunNorthYork(); }
+function dryRunMontreal() { return EdmontonMonitor.dryRunMontreal(); }
+function testNorthYorkWatchdog() { return EdmontonMonitor.testNorthYorkWatchdog(); }
+function testMontrealWatchdog() { return EdmontonMonitor.testMontrealWatchdog(); }
 function installPilot() { return EdmontonMonitor.installPilot(); }
 function dryRun() { return EdmontonMonitor.dryRun(); }
 function testAlert() { return EdmontonMonitor.testAlert(); }

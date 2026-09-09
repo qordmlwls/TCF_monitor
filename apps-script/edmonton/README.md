@@ -1,12 +1,85 @@
-# Edmonton Apps Script Pilot
+# North York, Edmonton, Montreal Apps Script Monitor
 
 This checker runs on Google's servers with a personal Google account. It requests
-one Edmonton check every five minutes and leaves the existing multi-city GitHub
+one check of each preferred centre every five minutes and leaves the existing multi-city GitHub
 monitor untouched. The laptop does not need to remain on after installation.
 It is not a reservation bot and never follows booking links, submits forms,
 enters queues, solves CAPTCHA, pays, or registers a candidate.
 
-## Activation
+The preference is **North York > Edmonton > Montreal**. Lower-priority cities
+still send alerts for verified openings. No exam-date restriction is applied;
+check your repeat-test eligibility before booking. An existing booking is never
+modified. North York means that campus specifically, not all Toronto campuses.
+
+## Upgrade the Existing Edmonton Project
+
+1. Build and upload to the same linked Google project.
+2. Run `dryRunAllCities`. All three must succeed. Zero available sessions is a
+   valid result; a failed or overlapping check is not.
+3. Create two additional Healthchecks.io checks, one for North York and one for
+   Montreal. Use five-minute periods, ten-minute grace, and your email channel.
+4. Set `TCF_NORTH_YORK_HEALTHCHECKS_URL` and `TCF_MONTREAL_HEALTHCHECKS_URL` to their
+   respective private ping URLs. Keep `TCF_HEALTHCHECKS_URL` unchanged for Edmonton.
+5. Run `installAllCities`. It validates all providers before replacing the old
+   Edmonton triggers with `checkAllCities` every five minutes and
+   `sendAllDailyReport` once daily. It preserves Edmonton's state and `Checks` sheet.
+6. Verify automatic executions, all three city sheets in the existing private
+   spreadsheet, all three independent watchdogs, and email delivery. Initial
+   currently open sessions produce real availability emails.
+
+The legacy `installPilot` remains available for a new Edmonton-only deployment.
+Once the all-city schedule exists, it reinstalls the all-city schedule instead.
+`stopPilot` similarly stops the all-city schedule after an upgrade.
+
+### Expanded Controls
+
+| Function | Effect |
+| --- | --- |
+| `installAllCities` | Validates all three, replaces only managed triggers, checks immediately. |
+| `dryRunAllCities` | Logs each city's snapshot without email, notification-state changes or heartbeat. |
+| `checkAllCities` | Performs real checks; a city error is recorded without skipping the other cities. |
+| `showAllStatus` | Shows each city's health and check-history link, in preference order. |
+| `sendAllDailyReport` | Sends one combined health report. |
+| `dryRunNorthYork`, `dryRunMontreal` | Checks just the named added provider without alerting. |
+| `testNorthYorkWatchdog`, `testMontrealWatchdog` | Sends an intentional DOWN test for that city. |
+| `stopAllCities` | Stops the Google schedule, retaining all state and leaving GitHub unchanged. |
+
+New state is stored separately under `NORTH_YORK_STATE_*` and `MONTREAL_STATE_*`.
+New diagnostic properties use `TCF_NORTH_YORK_*` and `TCF_MONTREAL_*`. These are
+managed automatically; do not edit or delete them. The separate `North York`
+and `Montreal` sheets use the same log format and retention as Edmonton's `Checks`.
+
+### Added Provider Rules
+
+- **North York:** validate every ActiveNet search page and all TCF Canada
+  sub-courses, excluding preparation courses and other campuses. Pagination is
+  sent in the HTTP `page_info` header, and returned page identity/counts must
+  match. Parent location or parent enrollment links are not availability evidence.
+  Require a North York leaf-course detail and its final matching **Enroll Now**
+  action; reject hold, full, waitlist, countdown, disabled and closed states.
+  Recheck previously open future courses even when the catalogue hides them.
+- **Montreal:** read the official public TCF Canada registration feed using its
+  current public settings. Require valid registration dates, available capacity,
+  unblocked flags, and an exact official registration link for the same exam ID.
+  A stale link with zero capacity does not alert. Cart links are never followed.
+- Valid empty North York/Montreal catalogs are successful observations. Partial
+  pages, schema changes and network failures are explicit errors, not sold-out
+  results. Each city's state, deduplication and success heartbeat are independent.
+- Requests have count and between-request time limits. North York detail/status
+  requests are batched in groups of eight. Shared execution checks Edmonton first
+  to protect the established home monitor if a new provider stalls.
+
+### Shared Free-Account Budget
+
+All three cities share Google's account-wide quotas. The 18.75-second average
+budget below applies to the **combined** five-minute run, not to each city.
+Runtime warnings start at 20 measured minutes/day for a city or 60 combined.
+The runtime state retains only the latest 24 hours (up to 650 attempts); the
+spreadsheet retains the longer history. State has per-city bounded storage and
+never silently resets deduplication when storage is full. Watch actual Google
+runtime for 24-48 hours before treating this expanded configuration as proven.
+
+## Legacy Edmonton-Only Activation
 
 When the project has already been uploaded, open its Apps Script editor:
 
@@ -178,9 +251,10 @@ pnpm install --frozen-lockfile
 pnpm run build
 pnpm test
 pnpm run verify
+node verify-preferred.mjs
 ```
 
-`verify` is read-only and runs locally. Its latency is **not** a Google-hosted
+`verify` and `verify-preferred.mjs` are read-only and run locally. Their latency is **not** a Google-hosted
 measurement. Use `node verify-live.mjs path/to/captured.html` for a saved full
 page. The captured public-table fixture contains no account or checkout data.
 Tests also execute the exact generated bundle in a sandbox with mocked Google

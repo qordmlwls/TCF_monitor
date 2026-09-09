@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { page, row, at, Properties } from "./fixtures.mjs";
 import { loadState } from "../src/storage.js";
+import { providerRoute } from "./provider-fixtures.mjs";
 
 const source = readFileSync(new URL("../dist/Code.gs", import.meta.url), "utf8");
 const heartbeat = "https://hc-ping.com/00000000-0000-4000-8000-000000000001";
@@ -14,10 +15,11 @@ function runtime() {
   const calls = [];
   const messages = [];
   const triggers = [];
+  const sheets = new Map();
   const env = { html: page(row()), http: 200, locked: false, quota: 100, failEmail: false, failLog: false, failPing: false,
     released: 0, now: Date.parse(at), spreadsheetCreated: 0 };
-  const sheet = {
-    setName() {}, setFrozenRows() {},
+  const makeSheet = rows => ({
+    rows, setName(name) { sheets.set(name, this); }, setFrozenRows() {},
     appendRow(values) { if (env.failLog) throw new Error("Log write failed"); rows.push([...values]); },
     getLastRow() { return rows.length; }, deleteRows(start, n) { rows.splice(start - 1, n); },
     getRange(r, c, nr = 1, nc = 1) { return {
@@ -25,8 +27,10 @@ function runtime() {
       setValues(values) { values.forEach((value, i) => { rows[r - 1 + i] = [...value]; }); },
       setValue(value) { rows[r - 1][c - 1] = value; },
     }; },
-  };
-  const book = { getSheets: () => [sheet], getSheetByName: () => sheet, getId: () => "test-spreadsheet" };
+  });
+  const sheet = makeSheet(rows);
+  const book = { getSheets: () => [sheet], getSheetByName: name => sheets.get(name) || null,
+    insertSheet: name => { const sheet = makeSheet([]); sheet.setName(name); return sheet; }, getId: () => "test-spreadsheet" };
   class Clock extends Date {
     constructor(...args) { super(...(args.length ? args : [env.now])); }
     static now() { return env.now; }
@@ -41,9 +45,13 @@ function runtime() {
       calls.push({ url, options });
       const ping = url.startsWith("https://hc-ping.com/");
       if (ping && env.failPing) throw new Error(`Transport failed ${url}`);
+      if (!ping && !url.includes("afedmonton.com")) {
+        const result = (env.providerRoute || providerRoute)(url, options);
+        return { getResponseCode: () => result.status, getContentText: () => result.body, getAllHeaders: () => ({ "Content-Type": result.contentType }) };
+      }
       return { getResponseCode: () => ping ? 200 : env.http, getContentText: () => env.html, getAllHeaders: () => ({ "Content-Type": "text/html; charset=utf-8" }) };
     } },
-    Utilities: { formatDate: date => new Date(date.getTime() - 6 * 3600000).toISOString().slice(0, 19) },
+    Utilities: { formatDate: (date, zone, pattern) => new Date(date.getTime() - (zone === "America/Toronto" ? 4 : 6) * 3600000).toISOString().slice(0, pattern === "yyyy-MM-dd" ? 10 : 19) },
     MailApp: { getRemainingDailyQuota: () => env.quota, sendEmail: email => {
       if (env.failEmail) throw new Error("Email transport failed");
       sent.push(email); env.quota -= 1;
@@ -55,15 +63,107 @@ function runtime() {
         const trigger = { getHandlerFunction: () => handler, handler };
         const builder = { timeBased() { return this; }, everyMinutes(n) { trigger.minutes = n; return this; },
           atHour(n) { trigger.hour = n; return this; }, everyDays(n) { trigger.days = n; return this; },
-          inTimezone(zone) { trigger.zone = zone; return this; }, create() { triggers.push(trigger); return trigger; } };
+          inTimezone(zone) { trigger.zone = zone; return this; }, create() {
+            if (env.failTrigger === handler) throw new Error("Trigger creation failed");
+            triggers.push(trigger); return trigger;
+          } };
         return builder;
       },
     },
   };
+  sandbox.UrlFetchApp.fetchAll = specs => specs.map(({ url, ...options }) => sandbox.UrlFetchApp.fetch(url, options));
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox);
-  return { sandbox, p, rows, sent, calls, messages, env, triggers };
+  return { sandbox, p, rows, sheets, sent, calls, messages, env, triggers };
 }
+
+function multiRuntime() {
+  const r = runtime(); r.env.now = Date.parse("2026-09-08T18:00:00Z");
+  r.p.setProperty("TCF_HEALTHCHECKS_URL", heartbeat);
+  r.p.setProperty("TCF_NORTH_YORK_HEALTHCHECKS_URL", heartbeat.replace(/1$/, "2"));
+  r.p.setProperty("TCF_MONTREAL_HEALTHCHECKS_URL", heartbeat.replace(/1$/, "3"));
+  return r;
+}
+
+test("three-city installation upgrades in place, keeps Edmonton history and is idempotent", () => {
+  const r = multiRuntime(); r.sandbox.installPilot();
+  const history = loadState(r.p).recent.length;
+  const unrelated = { getHandlerFunction: () => "unrelated" }; r.triggers.push(unrelated);
+  r.sandbox.installAllCities(); r.sandbox.installAllCities();
+  assert.equal(r.env.spreadsheetCreated, 1);
+  assert.equal(r.sheets.size, 3);
+  assert.equal(loadState(r.p).recent.length, history + 2);
+  assert.equal(r.triggers.length, 3);
+  assert.ok(r.triggers.includes(unrelated));
+  assert.equal(r.triggers.find(t => t.handler === "checkAllCities").minutes, 5);
+  assert.equal(r.triggers.filter(t => t.handler === "checkEdmonton").length, 0);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+  assert.equal(r.p.getProperty("TCF_MONTREAL_LOG_SPREADSHEET_ID"), "test-spreadsheet");
+  assert.match(r.sandbox.showAllStatus(), /Preference: North York > Edmonton > Montreal/);
+  r.sandbox.stopPilot();
+  assert.equal(r.triggers.length, 1);
+  assert.ok(loadState(r.p, "MONTREAL_STATE_").lastSuccess);
+});
+test("dry-run all cities changes no alert history, email or heartbeat", () => {
+  const r = multiRuntime();
+  assert.equal(r.sandbox.dryRunAllCities().length, 3);
+  assert.equal(r.sent.length, 0);
+  assert.equal(r.calls.filter(c => c.url.includes("hc-ping")).length, 0);
+  assert.equal(r.p.getProperty("MONTREAL_STATE_ACTIVE"), null);
+  assert.equal(r.sheets.get("North York").rows.length, 2);
+  assert.equal(r.sheets.get("Montreal").rows.length, 2);
+});
+test("a failing North York website cannot suppress Montreal or make its own watchdog healthy", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  r.env.providerRoute = url => url.includes("activecommunities") ? { status: 503, body: "down" } : providerRoute(url);
+  assert.throws(() => r.sandbox.checkAllCities(), /North York.*503/);
+  assert.ok(loadState(r.p).lastSuccess);
+  assert.ok(loadState(r.p, "MONTREAL_STATE_").lastSuccess);
+  assert.equal(loadState(r.p, "NORTH_YORK_STATE_").lastSuccess, null);
+  assert.equal(loadState(r.p, "NORTH_YORK_STATE_").failures, 1);
+  assert.equal(r.calls.filter(c => c.url === heartbeat.replace(/1$/, "2")).length, 0);
+  assert.equal(r.calls.filter(c => c.url === heartbeat.replace(/1$/, "3")).length, 1);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+  assert.equal(r.sheets.get("North York").rows.at(-1)[2], "FAILED");
+  r.env.providerRoute = providerRoute; r.env.now += 300000; r.sandbox.checkAllCities();
+  assert.equal(loadState(r.p, "NORTH_YORK_STATE_").failures, 0);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+});
+test("installation leaves the working schedule untouched on validation failure or overlap", () => {
+  const r = multiRuntime(); r.sandbox.installPilot();
+  const old = [...r.triggers];
+  r.env.locked = true;
+  assert.throws(() => r.sandbox.installAllCities(), /validation/);
+  assert.deepEqual(r.triggers, old);
+  r.env.locked = false;
+  r.env.providerRoute = () => ({ status: 503, body: "down" });
+  assert.throws(() => r.sandbox.installAllCities(), /503/);
+  assert.deepEqual(r.triggers, old);
+});
+test("installation rolls back new triggers if the daily trigger cannot be created", () => {
+  const r = multiRuntime(); r.sandbox.installPilot(); const old = [...r.triggers];
+  r.env.failTrigger = "sendAllDailyReport";
+  assert.throws(() => r.sandbox.installAllCities(), /Trigger creation failed/);
+  assert.deepEqual(r.triggers, old);
+});
+test("a corrupt city history stays an explicit failure while other cities continue", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  r.p.setProperty("NORTH_YORK_STATE_ACTIVE", "broken");
+  assert.throws(() => r.sandbox.checkAllCities(), /North York/);
+  assert.ok(loadState(r.p, "MONTREAL_STATE_").lastSuccess);
+  assert.equal(r.p.getProperty("NORTH_YORK_STATE_ACTIVE"), "broken");
+});
+
+test("multiple simulated days retain bounded 24-hour runtime history without repeated seat emails", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities(); r.env.quota = 1000;
+  for (let i = 0; i < 600; i++) { r.sandbox.checkAllCities(); r.env.now += 300000; }
+  for (const prefix of ["EDMONTON_STATE_", "NORTH_YORK_STATE_", "MONTREAL_STATE_"]) {
+    const state = loadState(r.p, prefix);
+    assert.equal(state.recent.length, 289);
+    assert.equal(state.failures, 0);
+  }
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+});
 
 test("generated bundle runs without Node/browser APIs in the Apps Script V8 environment", () => {
   const r = runtime();
