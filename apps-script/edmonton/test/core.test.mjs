@@ -132,6 +132,15 @@ test("a distinct reposted window alerts even if no closed observation occurred b
   assert.equal(evaluate(fetchOffers([oldOctoberOffer, newOctoberOffer]).rows, result.next, at, octoberWall).events.length, 0);
 });
 
+test("a temporarily missing current offer cannot be marked closed by its older sold-out duplicate", () => {
+  const fetched = fetchOffers([oldOctoberOffer, newOctoberOffer]);
+  const opened = evaluate(fetched.rows, {}, at, octoberWall); markSent(opened.next, opened.events);
+  const missing = evaluate([parseRow(oldOctoberOffer)], opened.next, at, octoberWall);
+  assert.equal(missing.events.length, 0);
+  assert.deepEqual(missing.next, opened.next);
+  assert.equal(evaluate(fetched.rows, missing.next, at, octoberWall).events.length, 0);
+});
+
 test("September 9 live regression fixture retains 27 offers and detects only the valid October 7 reopening", () => {
   const html = readFileSync(new URL("./fixtures/edmonton-2026-09-09.html", import.meta.url), "utf8");
   assert.equal(parsePage(html).rows.length, 27);

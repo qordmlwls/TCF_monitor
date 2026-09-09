@@ -184,7 +184,8 @@ Script properties:
   reopening. Registration-date and seat-count edits alone do not re-alert.
   A separately listed, disjoint registration offer can alert again even without
   an intervening closed observation. Adding/removing the old duplicate row does
-  not reset the current offer's notification history.
+  not reset the current offer's notification history. If only the older offer
+  remains, preserve the newer offer's history: its disappearance is not closure.
 - Preserve notification state if a session disappears or a fetch fails. A missing
   row is not proof of closure. Expire missing records only after 90 days.
 - Retry an unsent alert only after rechecking that the session is still bookable.

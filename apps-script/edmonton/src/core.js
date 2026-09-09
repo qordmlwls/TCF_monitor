@@ -211,9 +211,14 @@ export function evaluateSnapshot(snapshot, previous, checkedAt) {
     present.add(row.key);
     const old = previous[row.key];
     const fingerprint = JSON.stringify([row.spotsLeft, row.bookings, row.links, row.registrationDates, row.available]);
-    const priorWindow = row.registrationOffers && old?.fingerprint && registrationWindow(JSON.parse(old.fingerprint)[3]);
+    const priorWindow = !row.city && old?.fingerprint && registrationWindow(JSON.parse(old.fingerprint)[3]);
     const currentWindow = priorWindow && registrationWindow(row.registrationDates);
-    const newOffer = priorWindow && currentWindow && (priorWindow[1] <= currentWindow[0] || currentWindow[1] <= priorWindow[0]);
+    // Seeing only an older offer is not evidence that a missing newer offer closed.
+    if (priorWindow && currentWindow && currentWindow[1] <= priorWindow[0]) {
+      if (old.fingerprint !== fingerprint) changes.push({ ...row, previousAvailable: old.available });
+      continue;
+    }
+    const newOffer = row.registrationOffers && priorWindow && currentWindow && priorWindow[1] <= currentWindow[0];
     const notified = Boolean(old?.available && old?.notified && !newOffer);
     next[row.key] = { available: row.available, notified: row.available && notified, fingerprint, lastSeen: checkedAt };
     if (row.city === "North York") next[row.key].row = { city: row.city, sourceId: row.sourceId,
