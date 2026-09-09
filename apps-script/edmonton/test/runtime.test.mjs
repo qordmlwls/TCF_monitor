@@ -48,6 +48,13 @@ function runtime() {
       calls.push({ url, options });
       const ping = url.startsWith("https://hc-ping.com/");
       if (ping && env.failPing) throw new Error(`Transport failed ${url}`);
+      if (ping) {
+        const result = env.pingRoute ? env.pingRoute(url, options) : { status: 200, body: "OK" };
+        env.now += result.durationMs || 0;
+        if (result.error) throw new Error(result.error);
+        return { getResponseCode: () => result.status, getContentText: () => result.body || "",
+          getAllHeaders: () => result.headers || {} };
+      }
       if (!ping && !url.includes("afedmonton.com")) {
         const result = (env.providerRoute || providerRoute)(url, options);
         return { getResponseCode: () => result.status, getContentText: () => result.body, getAllHeaders: () => ({ "Content-Type": result.contentType }) };
@@ -316,6 +323,140 @@ test("private heartbeat URL is never written into logs or health emails", () => 
   r.sandbox.dryRun(); r.sandbox.checkEdmonton();
   assert.equal(r.p.getProperty("TCF_LAST_HEARTBEAT_STATUS"), "FAILED");
   assert.ok(!JSON.stringify([r.messages, r.rows, r.sent]).includes(heartbeat));
+});
+
+test("a fast transient heartbeat failure retries once and records recovery without warning", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); let attempts = 0;
+  r.env.pingRoute = () => ++attempts === 1 ? { error: `Transport failed ${heartbeat}` } : { status: 200, body: "OK" };
+  const result = r.sandbox.checkEdmonton();
+  assert.equal(result.heartbeat, "OK");
+  assert.equal(attempts, 2);
+  assert.match(result.details, /Attempt 1: Transport failed.*Attempt 2: HTTP 200 OK/);
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 0);
+  assert.ok(!JSON.stringify([r.messages, r.rows, r.sent]).includes(heartbeat));
+  assert.equal(JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY")).failures, 0);
+});
+
+test("exhausted retries escalate on the third failed check, reset on recovery and do not repeat seat mail", () => {
+  const r = runtime(); r.p.setProperty("TCF_HEALTHCHECKS_URL", heartbeat); r.sandbox.dryRun();
+  r.sandbox.checkEdmonton(); const accepted = JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY")).lastSuccessAt;
+  r.env.failPing = true;
+  for (let i = 1; i <= 4; i++) {
+    r.env.now += 300000;
+    assert.equal(r.sandbox.checkEdmonton().heartbeat, "FAILED");
+    const history = JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY"));
+    assert.equal(history.failures, i); assert.equal(history.lastSuccessAt, accepted);
+    assert.equal(r.sent.filter(m => m.subject.includes("health")).length, i < 3 ? 0 : 1);
+  }
+  assert.equal(r.calls.filter(c => c.url === heartbeat).length, 9);
+  assert.equal(loadState(r.p).failures, 0);
+  assert.equal(r.rows.at(-1)[2], "SUCCESS");
+  assert.match(r.sent.at(-1).body, /Seat check and alert processing succeeded/);
+  assert.ok(!JSON.stringify([r.messages, r.rows, r.sent]).includes(heartbeat));
+  r.env.failPing = false; r.env.now += 300000; r.sandbox.checkEdmonton();
+  const history = JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY"));
+  assert.equal(history.failures, 0); assert.ok(history.lastRecoveryAt); assert.ok(history.lastFailureAt);
+  assert.match(r.sandbox.showStatus(), /Last recovery.*2026/);
+  r.env.failPing = true; r.env.now += 300000; r.sandbox.checkEdmonton();
+  assert.equal(JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY")).failures, 1);
+  assert.equal(r.sent.filter(m => m.subject.includes("bookable")).length, 1);
+});
+
+test("slow failed heartbeat requests do not add another request", () => {
+  const r = multiRuntime(); r.sandbox.dryRun();
+  r.env.pingRoute = () => ({ status: 503, durationMs: 5000 });
+  assert.equal(r.sandbox.checkEdmonton().heartbeat, "FAILED");
+  assert.equal(r.calls.filter(c => c.url === heartbeat).length, 1);
+});
+
+test("a fast server error can recover on its single retry", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); let n = 0;
+  r.env.pingRoute = () => ++n === 1 ? { status: 503 } : { status: 200, body: "OK" };
+  assert.equal(r.sandbox.checkEdmonton().heartbeat, "OK");
+  assert.equal(n, 2);
+});
+
+test("permanent watchdog rejection warns immediately without retries or response-body leaks", () => {
+  for (const response of [{ status: 403, body: heartbeat }, { status: 200, body: "OK (not found)" },
+    { status: 200, body: "not found" }, { error: `Service invoked too many times for one day: ${heartbeat}` }]) {
+    const r = multiRuntime(); r.sandbox.dryRun(); r.env.pingRoute = () => response;
+    assert.equal(r.sandbox.checkEdmonton().heartbeat, "FAILED");
+    assert.equal(r.calls.filter(c => c.url === heartbeat).length, 1);
+    assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 1);
+    assert.ok(!JSON.stringify([r.messages, r.rows, r.sent]).includes(heartbeat));
+  }
+});
+
+test("rate limiting is not accepted as success and Retry-After survives later scheduled checks", () => {
+  for (const response of [{ status: 200, body: "OK (rate limited)" }, { status: 429, headers: { "Retry-After": "900" } },
+    { status: 503, headers: { "Retry-After": "Tue, 08 Sep 2026 18:15:00 GMT" } }]) {
+    const r = multiRuntime(); r.sandbox.dryRun(); r.env.pingRoute = () => response;
+    assert.equal(r.sandbox.checkEdmonton().heartbeat, "FAILED");
+    const until = JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY")).retryAfterAt;
+    assert.ok(until >= r.env.now + 300000);
+    r.env.now += 60000; r.sandbox.checkEdmonton();
+    assert.equal(r.calls.filter(c => c.url === heartbeat).length, 1);
+    assert.match(r.rows.at(-1)[9], /Waiting until/);
+    r.env.now = until; r.env.pingRoute = () => ({ status: 200, body: "OK" });
+    assert.equal(r.sandbox.checkEdmonton().heartbeat, "OK");
+    assert.equal(r.calls.filter(c => c.url === heartbeat).length, 2);
+  }
+});
+
+test("unexpected HTTP 200 content cannot claim healthy or leak arbitrary content", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.env.pingRoute = () => ({ status: 200, body: `<html>${heartbeat}</html>` });
+  assert.equal(r.sandbox.checkEdmonton().heartbeat, "FAILED");
+  assert.match(r.rows.at(-1)[9], /unexpected acknowledgement/);
+  assert.ok(!JSON.stringify(r.messages).includes(heartbeat));
+});
+
+test("North York watchdog failure remains isolated and reports include its diagnostics", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  r.env.pingRoute = url => url.endsWith("2") ? { status: 502 } : { status: 200, body: "OK" };
+  for (let i = 0; i < 3; i++) { r.sandbox.checkAllCities(); r.env.now += 300000; }
+  assert.equal(r.p.getProperty("TCF_LAST_HEARTBEAT_STATUS"), "OK");
+  assert.equal(r.p.getProperty("TCF_NORTH_YORK_LAST_HEARTBEAT_STATUS"), "FAILED");
+  assert.equal(r.p.getProperty("TCF_MONTREAL_LAST_HEARTBEAT_STATUS"), "OK");
+  assert.equal(r.sent.filter(m => m.subject.includes("North York health")).length, 1);
+  const before = r.calls.length; r.sandbox.sendAllDailyReport();
+  assert.equal(r.calls.length, before);
+  assert.match(r.sent.at(-1).body, /Consecutive delivery failures: 3; latest attempts: 2/);
+  assert.match(r.sent.at(-1).body, /HTTP 502/);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+});
+
+test("heartbeat and website warnings have independent throttles", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.env.pingRoute = () => ({ status: 403 });
+  r.sandbox.checkEdmonton(); r.env.http = 503;
+  for (let i = 0; i < 3; i++) { r.env.now += 300000; assert.throws(() => r.sandbox.checkEdmonton()); }
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 2);
+});
+
+test("unreadable heartbeat history cannot silently restart the warning threshold", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.p.setProperty("TCF_HEARTBEAT_DELIVERY", "broken");
+  r.env.failPing = true; r.sandbox.checkEdmonton();
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 1);
+  assert.match(r.sent.at(-1).body, /history could not be read or saved/);
+});
+
+test("ten minutes of unresolved delivery failure warns even with fewer than three checks", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.env.failPing = true;
+  r.sandbox.checkEdmonton(); r.env.now += 600000; r.sandbox.checkEdmonton();
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 1);
+  assert.equal(JSON.parse(r.p.getProperty("TCF_HEARTBEAT_DELIVERY")).failures, 2);
+});
+
+test("failed heartbeat-history storage is visible without invalidating a committed seat check", () => {
+  const r = multiRuntime(); r.sandbox.dryRun();
+  const original = r.p.setProperty.bind(r.p);
+  r.p.setProperty = (key, value) => {
+    if (key === "TCF_HEARTBEAT_DELIVERY") throw new Error("Storage unavailable");
+    return original(key, value);
+  };
+  assert.equal(r.sandbox.checkEdmonton().outcome, "SUCCESS");
+  assert.ok(loadState(r.p).lastSuccess);
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 1);
+  assert.match(r.rows.at(-1)[9], /Storage unavailable/);
 });
 test("stopping the pilot removes only its triggers and retains history", () => {
   const r = runtime(); r.sandbox.installPilot(); const previous = loadState(r.p);

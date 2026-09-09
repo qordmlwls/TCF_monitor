@@ -3781,6 +3781,79 @@ var EdmontonMonitor = (() => {
     };
   }
 
+  // src/heartbeat.js
+  function deliverHeartbeat(fetch, now, sanitize, url, payload, previous = {}) {
+    if (!url) return { status: "NOT_CONFIGURED", attempts: 0, details: "External watchdog not configured." };
+    if (previous.retryAfterAt > now()) {
+      return {
+        status: "FAILED",
+        attempts: 0,
+        retryAfterAt: previous.retryAfterAt,
+        details: `Waiting until ${new Date(previous.retryAfterAt).toISOString()} before retrying the watchdog.`
+      };
+    }
+    const started = now();
+    const diagnostics = [];
+    let permanent = false, retryAfterAt = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let retryable = false;
+      try {
+        const response = fetch(url, {
+          method: "post",
+          contentType: "text/plain",
+          payload,
+          followRedirects: false,
+          muteHttpExceptions: true,
+          validateHttpsCertificates: true
+        });
+        const status = response.getResponseCode();
+        const body = response.getContentText().trim();
+        if (status === 200 && body === "OK") {
+          diagnostics.push(`Attempt ${attempt}: HTTP 200 OK.`);
+          return { status: "OK", attempts: attempt, details: diagnostics.join(" ") };
+        }
+        const ignored = status !== 200 ? null : ["OK (not found)", "not found"].includes(body) ? "not found" : ["OK (rate limited)", "rate limited"].includes(body) ? "rate limited" : null;
+        diagnostics.push(`Attempt ${attempt}: HTTP ${status}${ignored ? ` (${ignored})` : status === 200 ? " (unexpected acknowledgement)" : ""}.`);
+        const rateLimited = status === 429 || ignored === "rate limited";
+        permanent = !rateLimited && (status >= 400 && status < 500 && status !== 408 || ignored === "not found");
+        retryable = [408, 500, 502, 503, 504].includes(status);
+        const headers = response.getAllHeaders();
+        const retryHeader = Object.keys(headers).find((key) => key.toLowerCase() === "retry-after");
+        const value = retryHeader ? String(headers[retryHeader]).trim() : "";
+        const requested = /^\d+$/.test(value) ? now() + Number(value) * 1e3 : Date.parse(value);
+        if (rateLimited || requested > now()) retryAfterAt = Math.max(now() + 3e5, requested || 0);
+      } catch (error) {
+        const detail = sanitize(error);
+        diagnostics.push(`Attempt ${attempt}: ${detail}.`);
+        permanent = /quota|too many times|permission|authorization|certificate|invalid argument/i.test(detail);
+        retryable = !permanent;
+      }
+      if (!retryable || permanent || retryAfterAt || now() - started >= 5e3 || attempt === 2) {
+        return { status: "FAILED", attempts: attempt, permanent, retryAfterAt, details: diagnostics.join(" ") };
+      }
+    }
+  }
+  function recordHeartbeat(previous, delivery, now) {
+    const at = new Date(now).toISOString();
+    const failed = delivery.status === "FAILED";
+    const failures = failed ? (previous.failures || 0) + 1 : 0;
+    const firstFailureAt = failed ? previous.firstFailureAt || at : null;
+    const recovered = delivery.status === "OK" && previous.failures > 0;
+    return {
+      status: delivery.status,
+      attempts: delivery.attempts,
+      details: delivery.details,
+      failures,
+      firstFailureAt,
+      lastSuccessAt: delivery.status === "OK" ? at : previous.lastSuccessAt || null,
+      lastFailureAt: failed ? at : previous.lastFailureAt || null,
+      lastFailureDetail: failed ? delivery.details : previous.lastFailureDetail || null,
+      lastRecoveryAt: recovered ? at : previous.lastRecoveryAt || null,
+      retryAfterAt: delivery.retryAfterAt || null,
+      needsWarning: failed && (Boolean(delivery.permanent) || failures >= 3 || now - Date.parse(firstFailureAt) >= 6e5)
+    };
+  }
+
   // src/runtime.js
   function createMonitorRuntime(profile) {
     const PAGE_URL2 = profile.pageUrl;
@@ -3898,33 +3971,47 @@ var EdmontonMonitor = (() => {
       return String(error.message || error).replace(/https:\/\/hc-ping\.com\/[^\s)]+/g, "[private heartbeat URL]").replace(/([?&]API_KEY=)[^\s&]+/gi, "$1[public key omitted]").slice(0, 1500);
     }
     function pingHeartbeat() {
-      const url = config().heartbeat;
-      if (!url) return "NOT_CONFIGURED";
-      try {
-        const response = UrlFetchApp.fetch(url, {
-          method: "post",
-          payload: `${profile.label} complete check and alert processing succeeded.`,
-          followRedirects: false,
-          muteHttpExceptions: true,
-          validateHttpsCertificates: true
-        });
-        if (response.getResponseCode() !== 200) throw new Error("Heartbeat service returned a non-200 response.");
-        return "OK";
-      } catch (_) {
-        console.error("Heartbeat delivery failed; external health status may show DOWN.");
-        return "FAILED";
-      }
-    }
-    function healthWarning(body) {
       const p = properties();
-      const last = Number(p.getProperty(key("LAST_HEALTH_WARNING_MS")) || 0);
+      let previous = {}, diagnosticError = "";
+      try {
+        previous = JSON.parse(p.getProperty(key("HEARTBEAT_DELIVERY")) || "{}");
+        if (!previous || typeof previous !== "object" || Array.isArray(previous)) throw new Error("Invalid heartbeat history");
+      } catch (error) {
+        previous = {};
+        diagnosticError = safeError(error);
+      }
+      const delivery = deliverHeartbeat(
+        (url, options) => UrlFetchApp.fetch(url, options),
+        () => Date.now(),
+        safeError,
+        config().heartbeat,
+        `${profile.label} complete check and alert processing succeeded.`,
+        previous
+      );
+      const history = recordHeartbeat(previous, delivery, Date.now());
+      try {
+        p.setProperties({ [key("LAST_HEARTBEAT_STATUS")]: delivery.status, [key("HEARTBEAT_DELIVERY")]: JSON.stringify(history) });
+      } catch (error) {
+        diagnosticError = safeError(error);
+      }
+      if (diagnosticError) {
+        history.needsWarning = true;
+        history.details += ` Heartbeat history could not be read or saved: ${diagnosticError}.`;
+      }
+      console.log(JSON.stringify({ city: profile.label, heartbeatDelivery: history }));
+      return history;
+    }
+    function healthWarning(body, channel = "HEALTH") {
+      const p = properties();
+      const warningKey = key(`LAST_${channel}_WARNING_MS`);
+      const last = Number(p.getProperty(warningKey) || 0);
       if (Date.now() - last < 6 * 36e5) return;
       try {
         send(`[TCF ${profile.label} health] Monitoring needs attention`, `${body}
 
 This is a monitoring warning, not a seat-availability alert.
 ${statusText()}`, 5);
-        p.setProperty(key("LAST_HEALTH_WARNING_MS"), String(Date.now()));
+        p.setProperty(warningKey, String(Date.now()));
       } catch (error) {
         console.error(`Health email could not be sent: ${safeError(error)}`);
       }
@@ -3990,10 +4077,10 @@ ${statusText()}`, 5);
         writeState(completed);
         state = completed;
         recorded = true;
-        const heartbeat = pingHeartbeat();
+        const heartbeatDelivery = pingHeartbeat();
+        const heartbeat = heartbeatDelivery.status;
         try {
-          properties().setProperty(key("LAST_HEARTBEAT_STATUS"), heartbeat);
-          const details = `Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
+          result.details = `Heartbeat: ${heartbeat}. ${heartbeatDelivery.details} Consecutive delivery failures: ${heartbeatDelivery.failures}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
           sheet.getRange(loggedRow, 3, 1, 8).setValues([[
             "SUCCESS",
             Math.round((Date.now() - started) / 100) / 10,
@@ -4002,13 +4089,17 @@ ${statusText()}`, 5);
             result.snapshot.length,
             result.snapshot.filter((row) => row.available).length,
             result.alerted,
-            details
+            result.details
           ]]);
         } catch (error) {
           console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`);
         }
         console.log(JSON.stringify({ ...result, snapshot: void 0, heartbeat, durationMs: Date.now() - started }));
-        if (heartbeat === "FAILED" || (result.gapMs || 0) > 15 * 6e4 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
+        if (heartbeatDelivery.needsWarning) {
+          healthWarning(`Seat check and alert processing succeeded. The independent watchdog delivery needs attention.
+Consecutive delivery failures: ${heartbeatDelivery.failures}. ${heartbeatDelivery.details}`, "HEARTBEAT");
+        }
+        if ((result.gapMs || 0) > 15 * 6e4 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
           healthWarning(`Latest check succeeded. Previous gap: ${Math.round((result.gapMs || 0) / 6e4)} minutes. Heartbeat: ${heartbeat}.`);
         }
         return { ...result, heartbeat };
@@ -4063,6 +4154,19 @@ Running this test does not start scheduled monitoring.`);
       const state = readState();
       const stats = summarize(state);
       const c = config();
+      let heartbeatDetail = "Heartbeat delivery diagnostics: not recorded yet.";
+      try {
+        const h = JSON.parse(properties().getProperty(key("HEARTBEAT_DELIVERY")) || "null");
+        if (h) heartbeatDetail = [
+          `Watchdog last accepted delivery (UTC): ${h.lastSuccessAt || "NONE RECORDED"}`,
+          `Consecutive delivery failures: ${h.failures}; latest attempts: ${h.attempts}`,
+          `Latest delivery details: ${h.details}`,
+          `Last failed delivery (UTC): ${h.lastFailureAt || "NONE RECORDED"}${h.lastFailureDetail ? `; ${h.lastFailureDetail}` : ""}`,
+          `Last recovery (UTC): ${h.lastRecoveryAt || "NONE RECORDED"}`
+        ].join("\n");
+      } catch (_) {
+        heartbeatDetail = "Heartbeat delivery diagnostics could not be read; inspect execution logs.";
+      }
       const enabled = ScriptApp.getProjectTriggers().filter((t) => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
       return [
         `TCF ${profile.label} monitor health (not a seat alert)`,
@@ -4078,6 +4182,7 @@ Running this test does not start scheduled monitoring.`);
         "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
         `Last session count: ${state.lastRowCount ?? "UNKNOWN"}; available: ${state.lastAvailableCount ?? "UNKNOWN"}`,
         `External watchdog: ${c.heartbeat ? `configured; last delivery ${properties().getProperty(key("LAST_HEARTBEAT_STATUS")) || "NOT YET TESTED"}` : "NOT CONFIGURED - a stopped script cannot warn you"}`,
+        heartbeatDetail,
         `Check history: ${c.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${c.spreadsheetId}/edit` : "NOT CREATED"}`,
         "",
         "A successful check describes one observation, not guaranteed continuous coverage.",

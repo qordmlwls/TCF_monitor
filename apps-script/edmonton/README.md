@@ -203,10 +203,28 @@ confirmed in that row; inspect subsequent rows and execution logs. An execution
 terminated by Google can leave only an execution error, without a spreadsheet
 row. External supervision is what catches this lack of success.
 
-Transient errors remain visible in execution logs. Separate health emails are
-throttled to at most one per six hours, with five email-recipient slots reserved
-for availability alerts. Google's own trigger-failure notifications are managed
-by Google and may still arrive.
+Watchdog delivery is recorded separately from seat-check success. A fast
+transport error or HTTP 408/500/502/503/504 receives **one retry**, only if the
+first attempt took less than five seconds. There are no retry sleeps. Requests
+already in progress cannot be interrupted by this budget. Rate limits and
+`Retry-After` defer delivery to a later check; rejected or unexpected responses
+(including HTTP 200 without the exact `OK` acknowledgement) are never treated
+as accepted heartbeats.
+
+An isolated failed delivery is logged, not immediately emailed. A watchdog
+warning is sent after three consecutive failed deliveries, ten minutes of
+unresolved failure, or immediately for a permanent rejection/configuration or
+diagnostic-storage problem. Recovery resets the streak. The separate external
+watchdog remains enabled with its existing five-minute period and ten-minute
+grace; it can warn even if Google stops executing this script.
+
+Each city's logs and daily report include attempts, sanitized error/status,
+consecutive failures, last accepted delivery, last failure, and recovery time.
+Earlier versions did not retain the delivery error, so old failures cannot be
+retrospectively attributed to a specific network or HTTP problem. Health emails
+are throttled to one per six hours **per city and warning type** (site health or
+watchdog delivery), with five email-recipient slots reserved for availability
+alerts. Google's own trigger-failure notifications may still arrive.
 
 Before any replacement of the existing Edmonton monitor, review at least 24-48
 hours of Google-hosted operation:

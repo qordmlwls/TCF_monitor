@@ -1,5 +1,6 @@
 import { markSent } from "./core.js";
 import { loadState, saveState, summarize } from "./storage.js";
+import { deliverHeartbeat, recordHeartbeat } from "./heartbeat.js";
 
 export function createMonitorRuntime(profile) {
 const PAGE_URL = profile.pageUrl;
@@ -102,26 +103,34 @@ function safeError(error) {
 }
 
 function pingHeartbeat() {
-  const url = config().heartbeat;
-  if (!url) return "NOT_CONFIGURED";
+  const p = properties();
+  let previous = {}, diagnosticError = "";
   try {
-    const response = UrlFetchApp.fetch(url, { method: "post", payload: `${profile.label} complete check and alert processing succeeded.`,
-      followRedirects: false, muteHttpExceptions: true, validateHttpsCertificates: true });
-    if (response.getResponseCode() !== 200) throw new Error("Heartbeat service returned a non-200 response.");
-    return "OK";
-  } catch (_) {
-    console.error("Heartbeat delivery failed; external health status may show DOWN.");
-    return "FAILED";
+    previous = JSON.parse(p.getProperty(key("HEARTBEAT_DELIVERY")) || "{}");
+    if (!previous || typeof previous !== "object" || Array.isArray(previous)) throw new Error("Invalid heartbeat history");
+  } catch (error) { previous = {}; diagnosticError = safeError(error); }
+  const delivery = deliverHeartbeat((url, options) => UrlFetchApp.fetch(url, options), () => Date.now(), safeError,
+    config().heartbeat, `${profile.label} complete check and alert processing succeeded.`, previous);
+  const history = recordHeartbeat(previous, delivery, Date.now());
+  try {
+    p.setProperties({ [key("LAST_HEARTBEAT_STATUS")]: delivery.status, [key("HEARTBEAT_DELIVERY")]: JSON.stringify(history) });
+  } catch (error) { diagnosticError = safeError(error); }
+  if (diagnosticError) {
+    history.needsWarning = true;
+    history.details += ` Heartbeat history could not be read or saved: ${diagnosticError}.`;
   }
+  console.log(JSON.stringify({ city: profile.label, heartbeatDelivery: history }));
+  return history;
 }
 
-function healthWarning(body) {
+function healthWarning(body, channel = "HEALTH") {
   const p = properties();
-  const last = Number(p.getProperty(key("LAST_HEALTH_WARNING_MS")) || 0);
+  const warningKey = key(`LAST_${channel}_WARNING_MS`);
+  const last = Number(p.getProperty(warningKey) || 0);
   if (Date.now() - last < 6 * 3600000) return;
   try {
     send(`[TCF ${profile.label} health] Monitoring needs attention`, `${body}\n\nThis is a monitoring warning, not a seat-availability alert.\n${statusText()}`, 5);
-    p.setProperty(key("LAST_HEALTH_WARNING_MS"), String(Date.now()));
+    p.setProperty(warningKey, String(Date.now()));
   } catch (error) { console.error(`Health email could not be sent: ${safeError(error)}`); }
 }
 
@@ -170,17 +179,20 @@ function runCheck(dryRun) {
     writeState(completed);
     state = completed;
     recorded = true;
-    const heartbeat = pingHeartbeat();
+    const heartbeatDelivery = pingHeartbeat();
+    const heartbeat = heartbeatDelivery.status;
     try {
-      properties().setProperty(key("LAST_HEARTBEAT_STATUS"), heartbeat);
-      const details = `Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
+      result.details = `Heartbeat: ${heartbeat}. ${heartbeatDelivery.details} Consecutive delivery failures: ${heartbeatDelivery.failures}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
       // Finalize the diagnostic columns together to avoid repeated remote sheet calls.
       sheet.getRange(loggedRow, 3, 1, 8).setValues([["SUCCESS", Math.round((Date.now() - started) / 100) / 10,
         result.gapMs === null ? "" : Math.round(result.gapMs / 6000) / 10, result.pages || 0,
-        result.snapshot.length, result.snapshot.filter(row => row.available).length, result.alerted, details]]);
+        result.snapshot.length, result.snapshot.filter(row => row.available).length, result.alerted, result.details]]);
     } catch (error) { console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`); }
     console.log(JSON.stringify({ ...result, snapshot: undefined, heartbeat, durationMs: Date.now() - started }));
-    if (heartbeat === "FAILED" || (result.gapMs || 0) > 15 * 60000 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
+    if (heartbeatDelivery.needsWarning) {
+      healthWarning(`Seat check and alert processing succeeded. The independent watchdog delivery needs attention.\nConsecutive delivery failures: ${heartbeatDelivery.failures}. ${heartbeatDelivery.details}`, "HEARTBEAT");
+    }
+    if ((result.gapMs || 0) > 15 * 60000 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
       healthWarning(`Latest check succeeded. Previous gap: ${Math.round((result.gapMs || 0) / 60000)} minutes. Heartbeat: ${heartbeat}.`);
     }
     return { ...result, heartbeat };
@@ -217,6 +229,15 @@ function statusText() {
   const state = readState();
   const stats = summarize(state);
   const c = config();
+  let heartbeatDetail = "Heartbeat delivery diagnostics: not recorded yet.";
+  try {
+    const h = JSON.parse(properties().getProperty(key("HEARTBEAT_DELIVERY")) || "null");
+    if (h) heartbeatDetail = [`Watchdog last accepted delivery (UTC): ${h.lastSuccessAt || "NONE RECORDED"}`,
+      `Consecutive delivery failures: ${h.failures}; latest attempts: ${h.attempts}`,
+      `Latest delivery details: ${h.details}`,
+      `Last failed delivery (UTC): ${h.lastFailureAt || "NONE RECORDED"}${h.lastFailureDetail ? `; ${h.lastFailureDetail}` : ""}`,
+      `Last recovery (UTC): ${h.lastRecoveryAt || "NONE RECORDED"}`].join("\n");
+  } catch (_) { heartbeatDetail = "Heartbeat delivery diagnostics could not be read; inspect execution logs."; }
   const enabled = ScriptApp.getProjectTriggers().filter(t => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
   return [`TCF ${profile.label} monitor health (not a seat alert)`, "",
     `Five-minute check triggers: ${enabled} (expected 1)`,
@@ -230,6 +251,7 @@ function statusText() {
     "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
     `Last session count: ${state.lastRowCount ?? "UNKNOWN"}; available: ${state.lastAvailableCount ?? "UNKNOWN"}`,
     `External watchdog: ${c.heartbeat ? `configured; last delivery ${properties().getProperty(key("LAST_HEARTBEAT_STATUS")) || "NOT YET TESTED"}` : "NOT CONFIGURED - a stopped script cannot warn you"}`,
+    heartbeatDetail,
     `Check history: ${c.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${c.spreadsheetId}/edit` : "NOT CREATED"}`,
     "", "A successful check describes one observation, not guaranteed continuous coverage.", PAGE_URL].join("\n");
 }
