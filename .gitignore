@@ -8,4 +8,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .tcf-monitor-state/
-
+node_modules/
+.clasp.json
+.clasprc.json
+apps-script/edmonton/.local/

@@ -1,0 +1,17 @@
+{
+  "name": "tcf-edmonton-apps-script",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "verify": "node verify-live.mjs"
+  },
+  "dependencies": {
+    "htmlparser2": "10.0.0",
+    "url-parse": "1.5.10"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}
