@@ -10,11 +10,13 @@ const MANAGED_HANDLERS = [profile.checkHandler, profile.reportHandler];
 const key = suffix => `${profile.propertyPrefix}${suffix}`;
 const readState = () => loadState(properties(), profile.statePrefix);
 const writeState = state => saveState(properties(), state, profile.statePrefix, profile.maxChunks || 8);
+let activeConfig = null;
 
 function properties() { return PropertiesService.getScriptProperties(); }
 function recentChecks(checks) { return checks.filter(check => check.at >= Date.now() - 86400000).slice(-650); }
 
 function config() {
+  if (activeConfig) return activeConfig;
   const p = properties();
   const recipient = p.getProperty("TCF_ALERT_EMAIL_TO") || "qordmlwls@gmail.com";
   if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(recipient)) throw new Error("Configure one valid TCF_ALERT_EMAIL_TO address.");
@@ -61,7 +63,9 @@ function appendCheck(sheet, result) {
     result.alerted || 0, result.details || "", snapshot];
   // External page text belongs in plain cells, never spreadsheet formulas.
   sheet.appendRow(row.map(value => typeof value === "string" && /^[=+@-]/.test(value) ? `'${value}` : value));
-  if (sheet.getLastRow() > 10001) sheet.deleteRows(2, sheet.getLastRow() - 10001);
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 10001) sheet.deleteRows(2, lastRow - 10001);
+  return Math.min(lastRow, 10001);
 }
 
 function requestOptions(options = {}) {
@@ -131,7 +135,7 @@ function runCheck(dryRun) {
   let state, sheet, result;
   let recorded = false;
   try {
-    config();
+    activeConfig = config();
     sheet = logSheet();
     state = readState();
     const fetched = profile.fetch(requestPage, { seen: state.seen, today: Utilities.formatDate(new Date(), profile.timezone, "yyyy-MM-dd") }, requestBatch);
@@ -158,7 +162,7 @@ function runCheck(dryRun) {
     }
     result.details = config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED.";
     result.durationMs = Date.now() - started;
-    appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+    const loggedRow = appendCheck(sheet, { ...result, outcome: "OBSERVED" });
     const previousFailures = state.failures;
     const completed = { ...state, lastSuccess: checkedAt, failures: 0, lastRowCount: fetched.rows.length,
       lastAvailableCount: assessment.snapshot.filter(row => row.available).length,
@@ -169,9 +173,11 @@ function runCheck(dryRun) {
     const heartbeat = pingHeartbeat();
     try {
       properties().setProperty(key("LAST_HEARTBEAT_STATUS"), heartbeat);
-      sheet.getRange(sheet.getLastRow(), 3).setValue("SUCCESS");
-      sheet.getRange(sheet.getLastRow(), 4).setValue(Math.round((Date.now() - started) / 100) / 10);
-      sheet.getRange(sheet.getLastRow(), 10).setValue(`Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`);
+      const details = `Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
+      // Finalize the diagnostic columns together to avoid repeated remote sheet calls.
+      sheet.getRange(loggedRow, 3, 1, 8).setValues([["SUCCESS", Math.round((Date.now() - started) / 100) / 10,
+        result.gapMs === null ? "" : Math.round(result.gapMs / 6000) / 10, result.pages || 0,
+        result.snapshot.length, result.snapshot.filter(row => row.available).length, result.alerted, details]]);
     } catch (error) { console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`); }
     console.log(JSON.stringify({ ...result, snapshot: undefined, heartbeat, durationMs: Date.now() - started }));
     if (heartbeat === "FAILED" || (result.gapMs || 0) > 15 * 60000 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
@@ -194,6 +200,7 @@ function runCheck(dryRun) {
     if (!dryRun && (!state || state.failures >= 3 || !state.lastSuccess || Date.now() - Date.parse(state.lastSuccess) > 15 * 60000)) healthWarning(message);
     throw new Error(message);
   } finally {
+    activeConfig = null;
     lock.releaseLock();
   }
 }

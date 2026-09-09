@@ -259,6 +259,9 @@ measurement. Use `node verify-live.mjs path/to/captured.html` for a saved full
 page. The captured public-table fixture contains no account or checkout data.
 Tests also execute the exact generated bundle in a sandbox with mocked Google
 services and no browser or Node globals.
+Test files run sequentially because concurrent V8 sandbox workers intermittently
+crashed the bundled macOS Node 24.19 test runner with SIGSEGV. This is a local
+test-runner setting, not a change to the hosted monitoring schedule.
 
 For a new deployment, enable the Apps Script API in
 <https://script.google.com/home/usersettings>, then:

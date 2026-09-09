@@ -3802,6 +3802,7 @@ var EdmontonMonitor = (() => {
     const key = (suffix) => `${profile.propertyPrefix}${suffix}`;
     const readState = () => loadState(properties(), profile.statePrefix);
     const writeState = (state) => saveState(properties(), state, profile.statePrefix, profile.maxChunks || 8);
+    let activeConfig = null;
     function properties() {
       return PropertiesService.getScriptProperties();
     }
@@ -3809,6 +3810,7 @@ var EdmontonMonitor = (() => {
       return checks.filter((check2) => check2.at >= Date.now() - 864e5).slice(-650);
     }
     function config() {
+      if (activeConfig) return activeConfig;
       const p = properties();
       const recipient = p.getProperty("TCF_ALERT_EMAIL_TO") || "qordmlwls@gmail.com";
       if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(recipient)) throw new Error("Configure one valid TCF_ALERT_EMAIL_TO address.");
@@ -3860,7 +3862,9 @@ var EdmontonMonitor = (() => {
         snapshot
       ];
       sheet.appendRow(row.map((value) => typeof value === "string" && /^[=+@-]/.test(value) ? `'${value}` : value));
-      if (sheet.getLastRow() > 10001) sheet.deleteRows(2, sheet.getLastRow() - 10001);
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 10001) sheet.deleteRows(2, lastRow - 10001);
+      return Math.min(lastRow, 10001);
     }
     function requestOptions(options = {}) {
       return {
@@ -3935,7 +3939,7 @@ ${statusText()}`, 5);
       let state, sheet, result;
       let recorded = false;
       try {
-        config();
+        activeConfig = config();
         sheet = logSheet();
         state = readState();
         const fetched = profile.fetch(requestPage, { seen: state.seen, today: Utilities.formatDate(/* @__PURE__ */ new Date(), profile.timezone, "yyyy-MM-dd") }, requestBatch);
@@ -3973,7 +3977,7 @@ ${statusText()}`, 5);
         }
         result.details = config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED.";
         result.durationMs = Date.now() - started;
-        appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+        const loggedRow = appendCheck(sheet, { ...result, outcome: "OBSERVED" });
         const previousFailures = state.failures;
         const completed = {
           ...state,
@@ -3989,9 +3993,17 @@ ${statusText()}`, 5);
         const heartbeat = pingHeartbeat();
         try {
           properties().setProperty(key("LAST_HEARTBEAT_STATUS"), heartbeat);
-          sheet.getRange(sheet.getLastRow(), 3).setValue("SUCCESS");
-          sheet.getRange(sheet.getLastRow(), 4).setValue(Math.round((Date.now() - started) / 100) / 10);
-          sheet.getRange(sheet.getLastRow(), 10).setValue(`Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`);
+          const details = `Heartbeat: ${heartbeat}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
+          sheet.getRange(loggedRow, 3, 1, 8).setValues([[
+            "SUCCESS",
+            Math.round((Date.now() - started) / 100) / 10,
+            result.gapMs === null ? "" : Math.round(result.gapMs / 6e3) / 10,
+            result.pages || 0,
+            result.snapshot.length,
+            result.snapshot.filter((row) => row.available).length,
+            result.alerted,
+            details
+          ]]);
         } catch (error) {
           console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`);
         }
@@ -4029,6 +4041,7 @@ ${statusText()}`, 5);
         if (!dryRun3 && (!state || state.failures >= 3 || !state.lastSuccess || Date.now() - Date.parse(state.lastSuccess) > 15 * 6e4)) healthWarning(message);
         throw new Error(message);
       } finally {
+        activeConfig = null;
         lock.releaseLock();
       }
     }

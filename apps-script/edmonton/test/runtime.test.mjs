@@ -24,7 +24,10 @@ function runtime() {
     getLastRow() { return rows.length; }, deleteRows(start, n) { rows.splice(start - 1, n); },
     getRange(r, c, nr = 1, nc = 1) { return {
       getValues() { return Array.from({ length: nr }, (_, i) => (rows[r - 1 + i] || []).slice(c - 1, c - 1 + nc)); },
-      setValues(values) { values.forEach((value, i) => { rows[r - 1 + i] = [...value]; }); },
+      setValues(values) { values.forEach((value, i) => {
+        rows[r - 1 + i] ||= [];
+        value.forEach((cell, j) => { rows[r - 1 + i][c - 1 + j] = cell; });
+      }); },
       setValue(value) { rows[r - 1][c - 1] = value; },
     }; },
   });
@@ -112,6 +115,23 @@ test("dry-run all cities changes no alert history, email or heartbeat", () => {
   assert.equal(r.p.getProperty("MONTREAL_STATE_ACTIVE"), null);
   assert.equal(r.sheets.get("North York").rows.length, 2);
   assert.equal(r.sheets.get("Montreal").rows.length, 2);
+});
+
+test("settings are read once per check but refreshed on the next invocation", () => {
+  const r = multiRuntime(); r.sandbox.dryRun();
+  const original = r.p.getProperty.bind(r.p); let reads = 0;
+  r.p.getProperty = key => { if (key === "TCF_HEALTHCHECKS_URL") reads++; return original(key); };
+  r.sandbox.checkEdmonton();
+  assert.equal(reads, 1);
+  const updated = heartbeat.replace(/1$/, "4"); r.p.setProperty("TCF_HEALTHCHECKS_URL", updated);
+  r.sandbox.checkEdmonton();
+  assert.equal(reads, 2);
+  assert.equal(r.calls.filter(c => c.url === updated).length, 1);
+  assert.equal(r.rows.at(-1).length, 11);
+  assert.equal(r.rows.at(-1)[1], "CHECK");
+  assert.equal(r.rows.at(-1)[2], "SUCCESS");
+  assert.match(r.rows.at(-1)[9], /Heartbeat: OK/);
+  assert.equal(JSON.parse(r.rows.at(-1)[10]).length, 1);
 });
 test("a failing North York website cannot suppress Montreal or make its own watchdog healthy", () => {
   const r = multiRuntime(); r.sandbox.dryRunAllCities();
