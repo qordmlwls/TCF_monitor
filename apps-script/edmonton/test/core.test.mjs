@@ -63,6 +63,86 @@ test("rejects redirects, non-HTML, and an empty catalog instead of reporting sol
     assert.throws(() => fetchComplete(() => response));
   }
 });
+
+const oldOctoberOffer = { exam: "TCF Canada - October 7", schedule: "Written Wednesday 07 Oct 2026 - 9:20am to 12:20pm",
+  dates: "Sep 8 2026 4:17pm - Sep 8 2026 5:17pm", spots: "SOLD OUT!", bookings: "Closed" };
+const newOctoberOffer = { ...oldOctoberOffer, dates: "Sep 9 2026 2:40pm - Sep 9 2026 3:40pm", spots: "10",
+  bookings: '<a href="/af/exam-selector/order/?exam_id=155">Book Now</a>' };
+const octoberWall = Date.parse("2026-09-09T14:55:00Z");
+const fetchOffers = offers => fetchComplete(() => ({ status: 200, body: page(offers.map(row).join("")) }));
+
+test("reposted registration and expired sold-out entry are resolved independently of row order", () => {
+  for (const offers of [[oldOctoberOffer, newOctoberOffer], [newOctoberOffer, oldOctoberOffer],
+    [oldOctoberOffer, newOctoberOffer, oldOctoberOffer]]) {
+    const fetched = fetchOffers(offers);
+    assert.equal(fetched.rows.length, 1);
+    const result = evaluate(fetched.rows, {}, at, octoberWall);
+    assert.equal(result.events.length, 1);
+    assert.match(result.events[0].links[0], /exam_id=155/);
+    assert.equal(result.events[0].key, parseRow(oldOctoberOffer).key);
+    assert.equal(result.snapshot[0].registrationOffers.length, 2);
+    assert.equal(result.snapshot[0].registrationOffers[0].reason, "sold_out");
+    assert.match(fetched.detail, /non-overlapping/);
+  }
+});
+
+test("duplicate offers do not bypass closed, sold out, unsupported action, or registration-window guards", () => {
+  for (const changes of [{ spots: "SOLD OUT!" }, { bookings: "Closed" }, { bookings: "On hold" }, { bookings: "" }]) {
+    const fetched = fetchOffers([oldOctoberOffer, { ...newOctoberOffer, ...changes }]);
+    assert.equal(evaluate(fetched.rows, {}, at, octoberWall).events.length, 0);
+  }
+  const fetched = fetchOffers([oldOctoberOffer, newOctoberOffer]);
+  for (const wall of ["2026-09-09T14:39:59Z", "2026-09-09T15:40:00Z", "2026-09-10T14:55:00Z"]) {
+    assert.equal(evaluate(fetched.rows, {}, at, Date.parse(wall)).events.length, 0);
+  }
+  const unsupported = fetchOffers([oldOctoberOffer, { ...newOctoberOffer, bookings: '<a href="https://untrusted.example">Book Now</a>' }]);
+  assert.throws(() => evaluate(unsupported.rows, {}, at, octoberWall), /Unsupported/);
+});
+
+test("same-window and overlapping or unknown-window contradictions still fail with identifying details", () => {
+  for (const dates of [oldOctoberOffer.dates, "Sep 8 2026 4:30pm - Sep 8 2026 5:30pm", "Unknown"]) {
+    assert.throws(() => fetchOffers([oldOctoberOffer, { ...newOctoberOffer, dates }]), /Conflicting.*October 7.*Registration windows/);
+  }
+});
+
+test("new registration offers can appear on later pages without being mistaken for repeated pagination", () => {
+  let count = 0;
+  const more = '<a class="dataShowMore" href="?s8-datatable1_start=1">Show More</a>';
+  const fetched = fetchComplete(() => ({ status: 200, body: count++ ? page(row(newOctoberOffer)) : page(row(oldOctoberOffer), more) }));
+  assert.equal(fetched.pages, 2);
+  assert.equal(evaluate(fetched.rows, {}, at, octoberWall).events.length, 1);
+});
+
+test("reposted offers preserve deduplication when old rows appear or disappear, and reopenings still alert", () => {
+  const single = evaluate([parseRow(newOctoberOffer)], {}, at, octoberWall); markSent(single.next, single.events);
+  const fetched = fetchOffers([oldOctoberOffer, newOctoberOffer]);
+  const duplicate = evaluate(fetched.rows, single.next, at, octoberWall);
+  assert.equal(duplicate.events.length, 0);
+  assert.equal(evaluate([parseRow(newOctoberOffer)], duplicate.next, at, octoberWall).events.length, 0);
+  const closed = evaluate(fetchOffers([oldOctoberOffer, { ...newOctoberOffer, bookings: "Closed" }]).rows, duplicate.next, at, octoberWall);
+  assert.equal(evaluate(fetched.rows, closed.next, at, octoberWall).events.length, 1);
+});
+
+test("a distinct reposted window alerts even if no closed observation occurred between offers", () => {
+  const prior = evaluate([parseRow({ ...oldOctoberOffer, spots: "2", bookings: openLink })], {}, at, Date.parse("2026-09-08T16:30:00Z"));
+  markSent(prior.next, prior.events);
+  const result = evaluate(fetchOffers([oldOctoberOffer, newOctoberOffer]).rows, prior.next, at, octoberWall);
+  assert.equal(result.events.length, 1);
+  markSent(result.next, result.events);
+  assert.equal(evaluate(fetchOffers([oldOctoberOffer, newOctoberOffer]).rows, result.next, at, octoberWall).events.length, 0);
+});
+
+test("September 9 live regression fixture retains 27 offers and detects only the valid October 7 reopening", () => {
+  const html = readFileSync(new URL("./fixtures/edmonton-2026-09-09.html", import.meta.url), "utf8");
+  assert.equal(parsePage(html).rows.length, 27);
+  const fetched = fetchComplete(() => ({ status: 200, body: html }));
+  assert.equal(fetched.rows.length, 26);
+  const result = evaluate(fetched.rows, {}, "2026-09-09T20:55:00Z", octoberWall);
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0].exam, "TCF Canada - October 7");
+  assert.equal(result.events[0].spotsLeft, "10");
+  assert.equal(result.snapshot.reduce((n, row) => n + (row.registrationOffers?.length || 1), 0), 27);
+});
 test("registration windows are checked using Edmonton wall time, including noon/midnight", () => {
   const parsed = parseRow();
   assert.equal(classify(parsed, Date.parse("2026-09-08T11:59:59Z")).available, false);

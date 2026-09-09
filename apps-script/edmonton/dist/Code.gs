@@ -3304,18 +3304,28 @@ var EdmontonMonitor = (() => {
       const page = parsePage(response.body, url);
       let added = 0;
       for (const row of page.rows) {
-        if (rows.has(row.key) && JSON.stringify(rows.get(row.key)) !== JSON.stringify(row)) {
-          throw new Error("Conflicting duplicate session in the schedule.");
-        }
-        if (!rows.has(row.key)) added += 1;
-        rows.set(row.key, row);
+        const offers = rows.get(row.key) || [];
+        if (offers.some((offer) => JSON.stringify(offer) === JSON.stringify(row))) continue;
+        offers.push(row);
+        rows.set(row.key, offers);
+        added += 1;
       }
       if (pages > 1 && page.rows.length && !added) throw new Error("Pagination repeated previously fetched sessions.");
       offset += page.rowCount;
       url = page.next || (page.rowCount >= 200 ? scheduleUrl(offset) : null);
     }
     if (!rows.size) throw new Error("No TCF Canada sessions found; availability is unknown, not sold out.");
-    return { rows: [...rows.values()], pages };
+    const sessions = [...rows.values()].map((offers) => {
+      if (offers.length === 1) return offers[0];
+      const windows = offers.map((offer) => registrationWindow(offer.registrationDates));
+      if (windows.some((window2) => !window2) || windows.some((window2, i) => windows.slice(i + 1).some((other) => window2[0] < other[1] && other[0] < window2[1]))) {
+        throw new Error(`Conflicting duplicate session in the schedule: ${offers[0].exam}; ${offers[0].schedule}. Registration windows overlap or cannot be validated: ${offers.map((offer) => offer.registrationDates).join(" | ")}`);
+      }
+      const ordered = offers.map((offer, i) => ({ offer, start: windows[i][0] })).sort((a, b) => a.start - b.start);
+      return { ...ordered[0].offer, registrationOffers: ordered.map((item) => item.offer) };
+    });
+    const repeated = sessions.filter((row) => row.registrationOffers).length;
+    return { rows: sessions, pages, detail: repeated ? `${repeated} repeated exam(s) resolved using distinct, non-overlapping registration windows; all offers retained in the snapshot.` : "" };
   }
   function registrationWindow(text) {
     const matches = [...text.matchAll(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm)\b/gi)];
@@ -3342,7 +3352,12 @@ var EdmontonMonitor = (() => {
     return { available: true, reason: "active_booking_link" };
   }
   function evaluate(rows, previous, checkedAt, edmontonWallTimeMs) {
-    return evaluateSnapshot(rows.map((row) => ({ ...row, ...classify(row, edmontonWallTimeMs) })), previous, checkedAt);
+    return evaluateSnapshot(rows.map((row) => {
+      if (!row.registrationOffers) return { ...row, ...classify(row, edmontonWallTimeMs) };
+      const offers = row.registrationOffers.map((offer) => ({ ...offer, ...classify(offer, edmontonWallTimeMs) }));
+      const started = offers.filter((offer) => registrationWindow(offer.registrationDates)[0] <= edmontonWallTimeMs);
+      return { ...started.at(-1) || offers[0], registrationOffers: offers };
+    }), previous, checkedAt);
   }
   function evaluateSnapshot(snapshot, previous, checkedAt) {
     const next = { ...previous };
@@ -3353,7 +3368,10 @@ var EdmontonMonitor = (() => {
       present.add(row.key);
       const old = previous[row.key];
       const fingerprint = JSON.stringify([row.spotsLeft, row.bookings, row.links, row.registrationDates, row.available]);
-      const notified = Boolean(old?.available && old?.notified);
+      const priorWindow = row.registrationOffers && old?.fingerprint && registrationWindow(JSON.parse(old.fingerprint)[3]);
+      const currentWindow = priorWindow && registrationWindow(row.registrationDates);
+      const newOffer = priorWindow && currentWindow && (priorWindow[1] <= currentWindow[0] || currentWindow[1] <= priorWindow[0]);
+      const notified = Boolean(old?.available && old?.notified && !newOffer);
       next[row.key] = { available: row.available, notified: row.available && notified, fingerprint, lastSeen: checkedAt };
       if (row.city === "North York") next[row.key].row = {
         city: row.city,

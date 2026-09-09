@@ -225,6 +225,23 @@ test("normal checks send one email and suppress unchanged repeats", () => {
   assert.equal(loadState(r.p).recent[1].gapMs, 300000);
   assert.match(r.sent[0].body, /No seat has been reserved/);
 });
+
+test("Edmonton recovers from the live duplicate-offer failure, emails the opening once and resumes its watchdog", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  r.env.now = Date.parse("2026-09-09T20:55:00Z");
+  r.env.html = readFileSync(new URL("./fixtures/edmonton-2026-09-09.html", import.meta.url), "utf8");
+  const results = r.sandbox.checkAllCities();
+  assert.equal(results[0].outcome, "SUCCESS");
+  assert.equal(results[0].heartbeat, "OK");
+  const emails = r.sent.filter(m => m.subject.includes("[TCF Edmonton]"));
+  assert.equal(emails.length, 1); assert.match(emails[0].body, /October 7/); assert.match(emails[0].body, /exam_id=155/);
+  assert.match(r.rows.at(-1)[9], /non-overlapping registration windows/);
+  assert.equal(loadState(r.p).lastRowCount, 26);
+  assert.equal(loadState(r.p).lastAvailableCount, 1);
+  r.env.now += 300000; r.sandbox.checkAllCities();
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Edmonton]")).length, 1);
+  assert.equal(r.calls.filter(c => c.url === heartbeat).length, 2);
+});
 test("closed seats do not send mail and retain the full observed snapshot", () => {
   const r = runtime();
   r.env.html = page(row({ bookings: "Closed", spots: "1" }));

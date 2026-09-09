@@ -166,6 +166,11 @@ Script properties:
 - Read the complete official schedule, requesting 200 rows per page and following
   validated same-site Show More links. Reject pagination loops, conflicting
   duplicates, missing tables, changed columns, HTTP errors, and empty TCF catalogs.
+- A repeated exam with separate, valid, non-overlapping registration windows is
+  treated as successive registration offers, not a contradictory duplicate.
+  Evaluate the latest started offer (or earliest future offer) while retaining
+  every offer in the snapshot. Never let an expired sold-out offer override the
+  current offer. Same-window/overlapping contradictions still fail explicitly.
 - Require an active, non-hidden **Book Now** or **Register** link to a recognized
   official booking path. A seat count alone is not enough.
 - Sold-out, zero-seat, closed, waitlisted, and not-yet-open statuses suppress
@@ -177,6 +182,9 @@ Script properties:
 - Do not notify for newly posted sessions that are already sold out or closed.
 - Send once per observed opening, and send again after an observed closure and
   reopening. Registration-date and seat-count edits alone do not re-alert.
+  A separately listed, disjoint registration offer can alert again even without
+  an intervening closed observation. Adding/removing the old duplicate row does
+  not reset the current offer's notification history.
 - Preserve notification state if a session disappears or a fetch fails. A missing
   row is not proof of closure. Expire missing records only after 90 days.
 - Retry an unsent alert only after rechecking that the session is still bookable.
