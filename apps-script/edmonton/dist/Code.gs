@@ -3438,13 +3438,34 @@ var EdmontonMonitor = (() => {
     if (!Number.isSafeInteger(value) || value < min) throw new Error(`${label}: invalid integer.`);
     return value;
   }
+  function responseDiagnostics(response) {
+    const headers = response.headers || {};
+    const header = (name) => String(headers[Object.keys(headers).find((key) => key.toLowerCase() === name)] || "").trim();
+    const mediaType = String(response.contentType || "").split(";", 1)[0].trim().toLowerCase();
+    const type = ["application/json", "text/html", "text/plain", "application/problem+json"].includes(mediaType) ? mediaType : mediaType ? "other" : "missing";
+    const body = typeof response.body === "string" ? response.body : "";
+    const sample = body.slice(0, 65536);
+    const signals = [];
+    const waf = header("x-amzn-waf-action").toLowerCase();
+    if (["challenge", "captcha"].includes(waf)) signals.push(`AWS WAF ${waf} header`);
+    if (header("cf-mitigated").toLowerCase() === "challenge") signals.push("Cloudflare challenge header");
+    if (/\b(?:awsWaf|gokuProps)\b|challenge-platform|\bverify (?:that )?you are (?:a )?human\b/i.test(sample)) signals.push("browser-challenge marker in body");
+    if (/\b(?:scheduled|undergoing|under) maintenance\b|\bmaintenance (?:window|in progress)\b/i.test(sample)) signals.push("maintenance wording in body");
+    const retry = header("retry-after");
+    let retryDetail = "";
+    if (retry) {
+      const date = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(retry);
+      retryDetail = `; retry-after=${/^\d{1,8}$/.test(retry) ? `${Number(retry)} seconds` : date ? retry : "present but unrecognized"}`;
+    }
+    return `Response diagnostics: content-type=${type}; body-characters=${body.length}; signals=${signals.join(", ") || "none recognized; cause unknown"}${retryDetail}.`;
+  }
   function json(response, label) {
-    if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}; availability unknown.`);
+    if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}; availability unknown. ${responseDiagnostics(response)}`);
     if (response.body.length > 3e6) throw new Error(`${label}: response too large.`);
     try {
       return JSON.parse(response.body);
     } catch (_) {
-      throw new Error(`${label}: invalid JSON response.`);
+      throw new Error(`${label}: invalid JSON response; availability unknown. ${responseDiagnostics(response)}`);
     }
   }
   function activeBody(data, label) {
@@ -3974,7 +3995,16 @@ var EdmontonMonitor = (() => {
     function responseData(response) {
       const headers = response.getAllHeaders();
       const typeKey = Object.keys(headers).find((key2) => key2.toLowerCase() === "content-type");
-      return { status: response.getResponseCode(), contentType: typeKey ? String(headers[typeKey]) : "", body: response.getContentText() };
+      const diagnosticHeaders = {};
+      for (const [name, value] of Object.entries(headers)) {
+        if (["retry-after", "x-amzn-waf-action", "cf-mitigated"].includes(name.toLowerCase())) diagnosticHeaders[name.toLowerCase()] = String(value);
+      }
+      return {
+        status: response.getResponseCode(),
+        contentType: typeKey ? String(headers[typeKey]) : "",
+        headers: diagnosticHeaders,
+        body: response.getContentText()
+      };
     }
     function requestPage(url, options) {
       return responseData(UrlFetchApp.fetch(url, requestOptions(options)));
@@ -4096,6 +4126,10 @@ ${statusText()}`, 5);
           lastAvailableCount: assessment.snapshot.filter((row) => row.available).length,
           recent: recentChecks([...state.recent, { at: Date.parse(checkedAt), ok: true, durationMs: Date.now() - started, gapMs: result.gapMs }])
         };
+        if (previousFailures > 0) completed.lastCheckRecovery = {
+          at: checkedAt,
+          gapMinutes: result.gapMs === null ? null : Math.round(result.gapMs / 6e4)
+        };
         writeState(completed);
         state = completed;
         recorded = true;
@@ -4130,6 +4164,7 @@ Consecutive delivery failures: ${heartbeatDelivery.failures}. ${heartbeatDeliver
         console.error(message);
         if (!dryRun3 && state && !recorded) {
           state.failures += 1;
+          state.lastCheckFailure = { at: (/* @__PURE__ */ new Date()).toISOString(), details: message };
           state.recent.push({ at: Date.now(), ok: false, durationMs: Date.now() - started });
           state.recent = recentChecks(state.recent);
           try {
@@ -4198,11 +4233,14 @@ Running this test does not start scheduled monitoring.`);
         `Minutes since success: ${stats.minutesSinceSuccess ?? "UNKNOWN"}`,
         `Successful checks in last 24 hours: ${stats.successfulChecks24h} (288 expected after a full day)`,
         `Failed checks in last 24 hours: ${stats.failedChecks24h}`,
+        `Consecutive failed checks: ${state.failures}`,
+        `Last recorded check failure (UTC): ${state.lastCheckFailure ? `${state.lastCheckFailure.at}; ${state.lastCheckFailure.details}` : "NONE RECORDED"}`,
+        `Last check recovery (UTC): ${state.lastCheckRecovery ? `${state.lastCheckRecovery.at}; observation gap: ${state.lastCheckRecovery.gapMinutes ?? "UNKNOWN"} minutes` : "NONE RECORDED"}`,
         `Longest observed gap in last 24 hours: ${stats.longestGapMinutes24h} minutes`,
         `Measured check runtime in last 24 hours: ${stats.measuredRuntimeMinutes24h} minutes`,
         `Average check runtime: ${stats.averageRuntimeSeconds24h ?? "UNKNOWN"} seconds`,
         "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
-        `Last session count: ${state.lastRowCount ?? "UNKNOWN"}; available: ${state.lastAvailableCount ?? "UNKNOWN"}`,
+        `Last successful snapshot (not a live count): sessions ${state.lastRowCount ?? "UNKNOWN"}; available ${state.lastAvailableCount ?? "UNKNOWN"}`,
         `External watchdog: ${c.heartbeat ? `configured; last delivery ${properties().getProperty(key("LAST_HEARTBEAT_STATUS")) || "NOT YET TESTED"}` : "NOT CONFIGURED - a stopped script cannot warn you"}`,
         heartbeatDetail,
         `Check history: ${c.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${c.spreadsheetId}/edit` : "NOT CREATED"}`,

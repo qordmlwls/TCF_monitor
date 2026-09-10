@@ -94,6 +94,50 @@ test("North York valid empty catalog is healthy but previously open missing leav
   assert.equal(assessment.events.length, 0);
   assert.equal(evaluateSnapshot([row], assessment.next, `${today}T12:10:00Z`).events.length, 1);
 });
+test("HTTP 202 never becomes a healthy empty catalog, even with a valid-looking JSON body", () => {
+  let calls = 0;
+  for (const body of ["", JSON.stringify(search())]) {
+    assert.throws(() => fetchNorthYork(() => { calls++; return { status: 202, body }; }, { today }),
+      /North York search: HTTP 202; availability unknown.*cause unknown/);
+  }
+  assert.equal(calls, 2, "one attempt per invocation, no in-run retry");
+});
+test("provider diagnostics identify explicit challenge signals without exposing secrets", () => {
+  const result = { status: 202, contentType: "text/html; charset=utf-8",
+    headers: { "X-Amzn-Waf-Action": "challenge", "Set-Cookie": "SECRET_COOKIE", "Retry-After": "300" },
+    body: '<script>var gokuProps = { token: "SECRET_TOKEN" };</script>' };
+  assert.throws(() => fetchNorthYork(() => result, { today }), error => {
+    assert.match(error.message, /content-type=text\/html; body-characters=\d+/);
+    assert.match(error.message, /AWS WAF challenge header/);
+    assert.match(error.message, /browser-challenge marker in body/);
+    assert.match(error.message, /retry-after=300 seconds/);
+    assert.doesNotMatch(error.message, /SECRET|script>|Set-Cookie/);
+    return true;
+  });
+});
+test("invalid JSON diagnostics retain maintenance wording without claiming a confirmed cause", () => {
+  const result = { status: 200, contentType: "text/html", body: "Currently undergoing maintenance. SECRET_BODY",
+    headers: { "Retry-After": "Thu, 10 Sep 2026 07:00:00 GMT" } };
+  assert.throws(() => fetchNorthYork(() => result, { today }), error => {
+    assert.match(error.message, /invalid JSON response; availability unknown/);
+    assert.match(error.message, /maintenance wording in body/);
+    assert.match(error.message, /retry-after=Thu, 10 Sep 2026 07:00:00 GMT/);
+    assert.doesNotMatch(error.message, /SECRET_BODY/);
+    return true;
+  });
+});
+test("unrecognized response metadata stays bounded and is never copied into logs", () => {
+  const result = { status: 202, contentType: "SECRET_TYPE", body: "SECRET_BODY".repeat(10000),
+    headers: { "Retry-After": "SECRET_RETRY", "x-amzn-waf-action": "SECRET_ACTION", "cf-mitigated": "challenge" } };
+  assert.throws(() => fetchNorthYork(() => result, { today }), error => {
+    assert.match(error.message, /content-type=other/);
+    assert.match(error.message, /Cloudflare challenge header/);
+    assert.match(error.message, /retry-after=present but unrecognized/);
+    assert.doesNotMatch(error.message, /SECRET/);
+    assert.ok(error.message.length < 400);
+    return true;
+  });
+});
 test("Montreal needs the correct exam type, dates, remaining capacity and exact booking action", () => {
   const rows = parseMontreal(montreal(), today);
   assert.equal(rows[0].available, true);

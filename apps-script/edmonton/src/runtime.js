@@ -80,7 +80,12 @@ function requestOptions(options = {}) {
 function responseData(response) {
   const headers = response.getAllHeaders();
   const typeKey = Object.keys(headers).find(key => key.toLowerCase() === "content-type");
-  return { status: response.getResponseCode(), contentType: typeKey ? String(headers[typeKey]) : "", body: response.getContentText() };
+  const diagnosticHeaders = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (["retry-after", "x-amzn-waf-action", "cf-mitigated"].includes(name.toLowerCase())) diagnosticHeaders[name.toLowerCase()] = String(value);
+  }
+  return { status: response.getResponseCode(), contentType: typeKey ? String(headers[typeKey]) : "",
+    headers: diagnosticHeaders, body: response.getContentText() };
 }
 
 function requestPage(url, options) { return responseData(UrlFetchApp.fetch(url, requestOptions(options))); }
@@ -176,6 +181,8 @@ function runCheck(dryRun) {
     const completed = { ...state, lastSuccess: checkedAt, failures: 0, lastRowCount: fetched.rows.length,
       lastAvailableCount: assessment.snapshot.filter(row => row.available).length,
       recent: recentChecks([...state.recent, { at: Date.parse(checkedAt), ok: true, durationMs: Date.now() - started, gapMs: result.gapMs }]) };
+    if (previousFailures > 0) completed.lastCheckRecovery = { at: checkedAt,
+      gapMinutes: result.gapMs === null ? null : Math.round(result.gapMs / 60000) };
     writeState(completed);
     state = completed;
     recorded = true;
@@ -201,6 +208,7 @@ function runCheck(dryRun) {
     console.error(message);
     if (!dryRun && state && !recorded) {
       state.failures += 1;
+      state.lastCheckFailure = { at: new Date().toISOString(), details: message };
       state.recent.push({ at: Date.now(), ok: false, durationMs: Date.now() - started });
       state.recent = recentChecks(state.recent);
       try { writeState(state); } catch (saveError) { console.error(safeError(saveError)); }
@@ -245,11 +253,14 @@ function statusText() {
     `Minutes since success: ${stats.minutesSinceSuccess ?? "UNKNOWN"}`,
     `Successful checks in last 24 hours: ${stats.successfulChecks24h} (288 expected after a full day)`,
     `Failed checks in last 24 hours: ${stats.failedChecks24h}`,
+    `Consecutive failed checks: ${state.failures}`,
+    `Last recorded check failure (UTC): ${state.lastCheckFailure ? `${state.lastCheckFailure.at}; ${state.lastCheckFailure.details}` : "NONE RECORDED"}`,
+    `Last check recovery (UTC): ${state.lastCheckRecovery ? `${state.lastCheckRecovery.at}; observation gap: ${state.lastCheckRecovery.gapMinutes ?? "UNKNOWN"} minutes` : "NONE RECORDED"}`,
     `Longest observed gap in last 24 hours: ${stats.longestGapMinutes24h} minutes`,
     `Measured check runtime in last 24 hours: ${stats.measuredRuntimeMinutes24h} minutes`,
     `Average check runtime: ${stats.averageRuntimeSeconds24h ?? "UNKNOWN"} seconds`,
     "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
-    `Last session count: ${state.lastRowCount ?? "UNKNOWN"}; available: ${state.lastAvailableCount ?? "UNKNOWN"}`,
+    `Last successful snapshot (not a live count): sessions ${state.lastRowCount ?? "UNKNOWN"}; available ${state.lastAvailableCount ?? "UNKNOWN"}`,
     `External watchdog: ${c.heartbeat ? `configured; last delivery ${properties().getProperty(key("LAST_HEARTBEAT_STATUS")) || "NOT YET TESTED"}` : "NOT CONFIGURED - a stopped script cannot warn you"}`,
     heartbeatDetail,
     `Check history: ${c.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${c.spreadsheetId}/edit` : "NOT CREATED"}`,

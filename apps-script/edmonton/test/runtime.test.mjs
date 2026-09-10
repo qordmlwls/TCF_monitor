@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { page, row, at, Properties } from "./fixtures.mjs";
 import { loadState } from "../src/storage.js";
-import { providerRoute } from "./provider-fixtures.mjs";
+import { providerRoute, response, search, candidate, detail, button } from "./provider-fixtures.mjs";
 
 const source = readFileSync(new URL("../dist/Code.gs", import.meta.url), "utf8");
 const heartbeat = "https://hc-ping.com/00000000-0000-4000-8000-000000000001";
@@ -57,7 +57,8 @@ function runtime() {
       }
       if (!ping && !url.includes("afedmonton.com")) {
         const result = (env.providerRoute || providerRoute)(url, options);
-        return { getResponseCode: () => result.status, getContentText: () => result.body, getAllHeaders: () => ({ "Content-Type": result.contentType }) };
+        return { getResponseCode: () => result.status, getContentText: () => result.body,
+          getAllHeaders: () => ({ "Content-Type": result.contentType, ...result.headers }) };
       }
       return { getResponseCode: () => ping ? 200 : env.http, getContentText: () => env.html, getAllHeaders: () => ({ "Content-Type": "text/html; charset=utf-8" }) };
     } },
@@ -155,6 +156,76 @@ test("a failing North York website cannot suppress Montreal or make its own watc
   r.env.providerRoute = providerRoute; r.env.now += 300000; r.sandbox.checkAllCities();
   assert.equal(loadState(r.p, "NORTH_YORK_STATE_").failures, 0);
   assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+});
+test("North York 202 gap preserves history, records diagnostics, isolates watchdogs and recovers", () => {
+  const r = multiRuntime();
+  const route = (url, options) => url.includes("activecommunities")
+    ? response(url.endsWith("/list") ? search([candidate()]) : url.includes("buttonstatus") ? button() : detail())
+    : providerRoute(url, options);
+  r.env.providerRoute = route; r.sandbox.dryRunAllCities(); r.sandbox.checkAllCities();
+  const before = loadState(r.p, "NORTH_YORK_STATE_");
+  const nyPing = heartbeat.replace(/1$/, "2");
+  r.env.providerRoute = (url, options) => url.includes("activecommunities") ? {
+    status: 202, body: "SECRET_RESPONSE", contentType: "text/html",
+    headers: { "X-Amzn-Waf-Action": "challenge", "Retry-After": "300", "Set-Cookie": "SECRET_COOKIE" },
+  } : providerRoute(url, options);
+  for (let i = 1; i <= 10; i++) {
+    r.env.now += 300000;
+    assert.throws(() => r.sandbox.checkAllCities(), /North York.*HTTP 202/);
+    const state = loadState(r.p, "NORTH_YORK_STATE_");
+    assert.equal(state.failures, i);
+    assert.equal(state.lastSuccess, before.lastSuccess);
+    assert.deepEqual(state.seen, before.seen);
+    assert.match(state.lastCheckFailure.details, /AWS WAF challenge header.*retry-after=300 seconds/);
+  }
+  const failed = loadState(r.p, "NORTH_YORK_STATE_");
+  assert.equal(r.calls.filter(c => c.url === nyPing).length, 1);
+  for (const suffix of ["1", "3"]) assert.equal(r.calls.filter(c => c.url === heartbeat.replace(/1$/, suffix)).length, 11);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF North York health]")).length, 1);
+  assert.match(r.sandbox.showAllStatus(), /Consecutive failed checks: 10/);
+  assert.match(r.sandbox.showAllStatus(), /Last successful snapshot \(not a live count\)/);
+  assert.match(r.sheets.get("North York").rows.at(-1)[9], /AWS WAF challenge header/);
+  assert.doesNotMatch(JSON.stringify([r.messages, r.sent, failed, r.sheets.get("North York").rows]), /SECRET/);
+  r.env.providerRoute = route; r.env.now += 300000; r.sandbox.checkAllCities();
+  const recovered = loadState(r.p, "NORTH_YORK_STATE_");
+  assert.equal(recovered.failures, 0);
+  assert.equal(recovered.lastSuccess, new Date(r.env.now).toISOString());
+  assert.deepEqual(recovered.lastCheckFailure, failed.lastCheckFailure);
+  assert.equal(recovered.lastCheckRecovery.gapMinutes, 55);
+  assert.equal(r.calls.filter(c => c.url === nyPing).length, 2);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF North York]")).length, 1);
+  assert.match(r.sandbox.showAllStatus(), /observation gap: 55 minutes/);
+});
+test("a North York 202 does not erase an unsent alert; recovery revalidates before sending", () => {
+  const r = multiRuntime();
+  const route = (url, options) => url.includes("activecommunities")
+    ? response(url.endsWith("/list") ? search([candidate()]) : url.includes("buttonstatus") ? button() : detail())
+    : providerRoute(url, options);
+  r.env.providerRoute = route; r.sandbox.dryRunAllCities(); r.env.failEmail = true;
+  assert.throws(() => r.sandbox.checkAllCities(), /Email transport failed/);
+  const before = loadState(r.p, "NORTH_YORK_STATE_").seen;
+  assert.equal(Object.keys(before).length, 1);
+  r.env.failEmail = false; r.env.now += 300000;
+  r.env.providerRoute = (url, options) => url.includes("activecommunities") ? { status: 202, body: "" } : providerRoute(url, options);
+  assert.throws(() => r.sandbox.checkAllCities(), /HTTP 202/);
+  assert.deepEqual(loadState(r.p, "NORTH_YORK_STATE_").seen, before);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF North York]")).length, 0);
+  r.env.providerRoute = route; r.env.now += 300000; r.sandbox.checkAllCities();
+  r.env.now += 300000; r.sandbox.checkAllCities();
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF North York]")).length, 1);
+});
+test("failed North York dry-run logs diagnostics without changing saved health or watchdog", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities(); r.sandbox.checkAllCities();
+  const before = loadState(r.p, "NORTH_YORK_STATE_");
+  const pings = r.calls.filter(c => c.url.includes("hc-ping")).length;
+  const mails = r.sent.length;
+  r.env.providerRoute = () => ({ status: 202, body: "", contentType: "text/html", headers: { "X-Amzn-Waf-Action": "challenge" } });
+  assert.throws(() => r.sandbox.dryRunNorthYork(), /HTTP 202/);
+  assert.deepEqual(loadState(r.p, "NORTH_YORK_STATE_"), before);
+  assert.match(r.sheets.get("North York").rows.at(-1)[9], /AWS WAF challenge header/);
+  assert.equal(r.calls.filter(c => c.url.includes("hc-ping")).length, pings);
+  assert.equal(r.sent.length, mails);
 });
 test("installation leaves the working schedule untouched on validation failure or overlap", () => {
   const r = multiRuntime(); r.sandbox.installPilot();

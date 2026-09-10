@@ -21,10 +21,34 @@ function integer(value, label, min = 0) {
   return value;
 }
 
+function responseDiagnostics(response) {
+  // Record only bounded, recognized metadata; never log response bodies, cookies or tokens.
+  const headers = response.headers || {};
+  const header = name => String(headers[Object.keys(headers).find(key => key.toLowerCase() === name)] || "").trim();
+  const mediaType = String(response.contentType || "").split(";", 1)[0].trim().toLowerCase();
+  const type = ["application/json", "text/html", "text/plain", "application/problem+json"].includes(mediaType)
+    ? mediaType : mediaType ? "other" : "missing";
+  const body = typeof response.body === "string" ? response.body : "";
+  const sample = body.slice(0, 65536);
+  const signals = [];
+  const waf = header("x-amzn-waf-action").toLowerCase();
+  if (["challenge", "captcha"].includes(waf)) signals.push(`AWS WAF ${waf} header`);
+  if (header("cf-mitigated").toLowerCase() === "challenge") signals.push("Cloudflare challenge header");
+  if (/\b(?:awsWaf|gokuProps)\b|challenge-platform|\bverify (?:that )?you are (?:a )?human\b/i.test(sample)) signals.push("browser-challenge marker in body");
+  if (/\b(?:scheduled|undergoing|under) maintenance\b|\bmaintenance (?:window|in progress)\b/i.test(sample)) signals.push("maintenance wording in body");
+  const retry = header("retry-after");
+  let retryDetail = "";
+  if (retry) {
+    const date = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(retry);
+    retryDetail = `; retry-after=${/^\d{1,8}$/.test(retry) ? `${Number(retry)} seconds` : date ? retry : "present but unrecognized"}`;
+  }
+  return `Response diagnostics: content-type=${type}; body-characters=${body.length}; signals=${signals.join(", ") || "none recognized; cause unknown"}${retryDetail}.`;
+}
+
 function json(response, label) {
-  if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}; availability unknown.`);
+  if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}; availability unknown. ${responseDiagnostics(response)}`);
   if (response.body.length > 3000000) throw new Error(`${label}: response too large.`);
-  try { return JSON.parse(response.body); } catch (_) { throw new Error(`${label}: invalid JSON response.`); }
+  try { return JSON.parse(response.body); } catch (_) { throw new Error(`${label}: invalid JSON response; availability unknown. ${responseDiagnostics(response)}`); }
 }
 
 function activeBody(data, label) {

@@ -69,6 +69,20 @@ and `Montreal` sheets use the same log format and retention as Edmonton's `Check
   requests are batched in groups of eight. Shared execution checks Edmonton first
   to protect the established home monitor if a new provider stalls.
 
+HTTP 202 is not a validated catalog and never means zero seats. Non-200 or invalid
+JSON responses now log their media type, body character count, recognized challenge
+headers/body markers, maintenance wording, and a recognized Retry-After value.
+Unrecognized responses explicitly retain an unknown cause. These are diagnostic
+signals, not proof of maintenance or the cause of a previous incident. Response
+bodies, cookies and tokens are not logged; there is no challenge bypass or added
+in-run retry. The next scheduled check attempts normal access again.
+
+Health reports retain the last recorded check error and recovery separately from
+watchdog-delivery errors. The session count is explicitly the last successful
+snapshot, not a current count during an outage. This diagnostic upgrade does not
+reconstruct missing details from earlier failures, prevent provider outages, or
+change triggers, availability rules, deduplication or warning thresholds.
+
 ### Shared Free-Account Budget
 
 All three cities share Google's account-wide quotas. The 18.75-second average
