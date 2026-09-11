@@ -4053,16 +4053,19 @@ var EdmontonMonitor = (() => {
       console.log(JSON.stringify({ city: profile.label, heartbeatDelivery: history }));
       return history;
     }
-    function healthWarning(body, channel = "HEALTH") {
+    function healthWarning(body, channel = "HEALTH", snapshot = null) {
       const p = properties();
       const warningKey = key(`LAST_${channel}_WARNING_MS`);
       const last = Number(p.getProperty(warningKey) || 0);
       if (Date.now() - last < 6 * 36e5) return;
       try {
-        send(`[TCF ${profile.label} health] Monitoring needs attention`, `${body}
+        const isRuntime = ["RUNTIME", "COMBINED_RUNTIME"].includes(channel);
+        const subject = channel === "COMBINED_RUNTIME" ? "[TCF runtime] Combined runtime budget advisory" : isRuntime ? `[TCF ${profile.label} runtime] Runtime budget advisory` : `[TCF ${profile.label} health] Monitoring needs attention`;
+        const notice = isRuntime ? "This is a runtime-budget advisory, not a seat alert or a report that a check failed." : "This is a monitoring warning, not a seat-availability alert.";
+        send(subject, `${body}
 
-This is a monitoring warning, not a seat-availability alert.
-${statusText()}`, 5);
+${notice}
+${statusText(snapshot?.state, snapshot?.stats)}`, 5);
         p.setProperty(warningKey, String(Date.now()));
       } catch (error) {
         console.error(`Health email could not be sent: ${safeError(error)}`);
@@ -4155,8 +4158,18 @@ ${statusText()}`, 5);
           healthWarning(`Seat check and alert processing succeeded. The independent watchdog delivery needs attention.
 Consecutive delivery failures: ${heartbeatDelivery.failures}. ${heartbeatDelivery.details}`, "HEARTBEAT");
         }
-        if ((result.gapMs || 0) > 15 * 6e4 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
-          healthWarning(`Latest check succeeded. Previous gap: ${Math.round((result.gapMs || 0) / 6e4)} minutes. Heartbeat: ${heartbeat}.`);
+        if ((result.gapMs || 0) > 15 * 6e4 || previousFailures >= 3) {
+          healthWarning(`Latest check succeeded after a monitoring interruption. Previous successful-observation gap: ${Math.round((result.gapMs || 0) / 6e4)} minutes. Preceding failed checks: ${previousFailures}. Heartbeat: ${heartbeat}.`);
+        }
+        const stats = summarize(state);
+        if (stats.measuredRuntimeMinutes24h > 20) {
+          healthWarning(
+            `Runtime advisory threshold crossed: ${stats.measuredRuntimeMinutes24h.toFixed(1)} measured minutes in the last 24 hours (city advisory threshold: over 20 minutes).
+Latest check and alert processing succeeded. Heartbeat: ${heartbeat}.
+This threshold is our early-warning budget, not Google's account-wide quota limit. All cities and other scripts share that quota. No monitoring schedule has been changed.`,
+            "RUNTIME",
+            { state, stats }
+          );
         }
         return { ...result, heartbeat };
       } catch (error) {
@@ -4207,9 +4220,7 @@ No available seat has been detected or reserved.
 Running this test does not start scheduled monitoring.`);
       console.log("Google accepted the test email. Confirm it arrived in your inbox.");
     }
-    function statusText() {
-      const state = readState();
-      const stats = summarize(state);
+    function statusText(state = readState(), stats = summarize(state)) {
       const c = config();
       let heartbeatDetail = "Heartbeat delivery diagnostics: not recorded yet.";
       try {
@@ -4401,8 +4412,11 @@ Running this test does not start scheduled monitoring.`);
     }
     console.log(JSON.stringify(results.map(({ city, checkedAt, outcome, heartbeat, alerted }) => ({ city, checkedAt, outcome, heartbeat, alerted }))));
     try {
-      const totalMinutes = preference.reduce((sum, [, monitor]) => sum + monitor.summary().measuredRuntimeMinutes24h, 0);
-      if (totalMinutes > 60) edmonton.healthWarning(`Combined measured runtime: ${totalMinutes.toFixed(1)} minutes in 24 hours. All scripts share Google's daily runtime quota; review frequency.`);
+      const runtimes = preference.map(([city, monitor]) => ({ city, minutes: monitor.summary().measuredRuntimeMinutes24h }));
+      const totalMinutes = runtimes.reduce((sum, city) => sum + city.minutes, 0);
+      if (totalMinutes > 60) edmonton.healthWarning(`Combined runtime advisory threshold crossed: ${totalMinutes.toFixed(1)} measured minutes in 24 hours (combined advisory threshold: over 60 minutes).
+${runtimes.map(({ city, minutes }) => `${city}: ${minutes.toFixed(1)} minutes`).join("\n")}
+This is an estimate, not Google's account-wide quota counter. All cities and other scripts share that quota; review runtime before changing frequency. No monitoring schedule has been changed.`, "COMBINED_RUNTIME");
     } catch (error) {
       errors.push(`Combined health report: ${error.message}`);
     }

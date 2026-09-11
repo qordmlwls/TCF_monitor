@@ -88,6 +88,13 @@ change triggers, availability rules, deduplication or warning thresholds.
 All three cities share Google's account-wide quotas. The 18.75-second average
 budget below applies to the **combined** five-minute run, not to each city.
 Runtime warnings start at 20 measured minutes/day for a city or 60 combined.
+These are early-warning budgets, not Google's quota limits. They use explicitly
+labeled runtime-advisory emails, separate from website/check-failure warnings.
+Each city advisory and the combined advisory have their own six-hour cooldown;
+they cannot suppress check-failure or heartbeat-delivery warnings. City runtime
+advisories use the same 24-hour statistics for the threshold and email report,
+so an expiring history entry cannot make the displayed reason disappear.
+Advisories never change the schedule or the availability-alert rules.
 The runtime state retains only the latest 24 hours (up to 650 attempts); the
 spreadsheet retains the longer history. State has per-city bounded storage and
 never silently resets deduplication when storage is full. Watch actual Google

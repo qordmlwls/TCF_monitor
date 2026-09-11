@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { page, row, at, Properties } from "./fixtures.mjs";
-import { loadState } from "../src/storage.js";
+import { loadState, saveState } from "../src/storage.js";
 import { providerRoute, response, search, candidate, detail, button } from "./provider-fixtures.mjs";
 
 const source = readFileSync(new URL("../dist/Code.gs", import.meta.url), "utf8");
@@ -405,6 +405,75 @@ test("health emails are separate from seat alerts and are throttled", () => {
   assert.equal(r.sent.length, 1);
   assert.match(r.sent[0].subject, /health/);
   assert.equal(loadState(r.p).failures, 5);
+});
+function seedRuntime(r, minutes, prefix = "EDMONTON_STATE_") {
+  const state = loadState(r.p, prefix);
+  state.recent = Array.from({ length: 12 }, (_, i) => ({
+    at: r.env.now - (12 - i) * 300000, ok: true, durationMs: minutes * 60000 / 12, gapMs: 300000,
+  }));
+  saveState(r.p, state, prefix);
+}
+test("healthy high-runtime checks explain the advisory without claiming a monitoring failure", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.sandbox.checkEdmonton();
+  seedRuntime(r, 20.1); r.env.now += 300000;
+  const result = r.sandbox.checkEdmonton();
+  assert.equal(result.outcome, "SUCCESS"); assert.equal(result.heartbeat, "OK");
+  const advisory = r.sent.find(m => m.subject.includes("runtime"));
+  assert.equal(advisory.subject, "[TCF Edmonton runtime] Runtime budget advisory");
+  assert.match(advisory.body, /20\.1 measured minutes.*threshold: over 20 minutes/);
+  assert.match(advisory.body, /Latest check and alert processing succeeded/);
+  assert.match(advisory.body, /not a seat alert or a report that a check failed/);
+  assert.match(advisory.body, /Measured check runtime in last 24 hours: 20\.1 minutes/);
+  assert.doesNotMatch(advisory.body, /after a monitoring interruption/);
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 0);
+  assert.equal(r.p.getProperty("TCF_LAST_HEALTH_WARNING_MS"), null);
+  r.env.now += 300000; r.sandbox.checkEdmonton();
+  assert.equal(r.sent.filter(m => m.subject.includes("runtime")).length, 1);
+  r.env.now += 6 * 3600000; r.sandbox.checkEdmonton();
+  assert.equal(r.sent.filter(m => m.subject.includes("runtime")).length, 2);
+});
+test("runtime advisory preserves its threshold snapshot when a 24-hour entry expires while sending", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.sandbox.checkEdmonton();
+  r.env.now += 300000; seedRuntime(r, 20);
+  const state = loadState(r.p);
+  state.recent.unshift({ at: r.env.now - 86400000, ok: true, durationMs: 6000, gapMs: 300000 });
+  saveState(r.p, state);
+  const get = r.p.getProperty.bind(r.p);
+  r.p.getProperty = name => { if (name === "TCF_LAST_RUNTIME_WARNING_MS") r.env.now++; return get(name); };
+  r.sandbox.checkEdmonton();
+  const advisory = r.sent.find(m => m.subject.includes("runtime"));
+  assert.match(advisory.body, /threshold crossed: 20\.1/);
+  assert.match(advisory.body, /Measured check runtime in last 24 hours: 20\.1 minutes/);
+  assert.match(r.sandbox.showStatus(), /Measured check runtime in last 24 hours: 20 minutes/);
+});
+test("runtime advisory cannot suppress a later real check or heartbeat warning", () => {
+  const r = multiRuntime(); r.sandbox.dryRun(); r.sandbox.checkEdmonton();
+  seedRuntime(r, 21); r.env.now += 300000; r.sandbox.checkEdmonton();
+  assert.equal(r.sent.filter(m => m.subject.includes("runtime")).length, 1);
+  r.env.pingRoute = () => ({ status: 403 }); r.env.now += 300000; r.sandbox.checkEdmonton();
+  r.env.http = 503;
+  for (let i = 0; i < 3; i++) { r.env.now += 300000; assert.throws(() => r.sandbox.checkEdmonton()); }
+  assert.equal(r.sent.filter(m => m.subject.includes("health")).length, 2);
+  assert.equal(loadState(r.p).failures, 3);
+});
+test("city and combined runtime advisories keep independent thresholds and cooldowns", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities(); r.sandbox.checkAllCities();
+  for (const prefix of ["EDMONTON_STATE_", "NORTH_YORK_STATE_", "MONTREAL_STATE_"]) seedRuntime(r, 20, prefix);
+  r.env.now += 300000; r.sandbox.checkAllCities();
+  assert.equal(r.sent.filter(m => m.subject.includes("runtime")).length, 0);
+  seedRuntime(r, 20.1); r.env.now += 300000; r.sandbox.checkAllCities();
+  const advisories = r.sent.filter(m => m.subject.includes("runtime"));
+  assert.equal(advisories.length, 2);
+  const combined = advisories.find(m => m.subject.includes("Combined"));
+  assert.match(combined.body, /60\.1 measured minutes.*threshold: over 60 minutes/);
+  assert.match(combined.body, /North York: 20\.0 minutes/);
+  assert.match(combined.body, /Edmonton: 20\.1 minutes/);
+  assert.match(combined.body, /Montreal: 20\.0 minutes/);
+  assert.ok(r.p.getProperty("TCF_LAST_RUNTIME_WARNING_MS"));
+  assert.ok(r.p.getProperty("TCF_LAST_COMBINED_RUNTIME_WARNING_MS"));
+  assert.equal(r.p.getProperty("TCF_LAST_HEALTH_WARNING_MS"), null);
+  r.env.now += 300000; r.sandbox.checkAllCities();
+  assert.equal(r.sent.filter(m => m.subject.includes("runtime")).length, 2);
 });
 test("private heartbeat URL is never written into logs or health emails", () => {
   const r = runtime(); r.p.setProperty("TCF_HEALTHCHECKS_URL", heartbeat); r.env.failPing = true;

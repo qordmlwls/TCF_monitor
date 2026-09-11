@@ -49,8 +49,9 @@ export function checkAllCities() {
   }
   console.log(JSON.stringify(results.map(({ city, checkedAt, outcome, heartbeat, alerted }) => ({ city, checkedAt, outcome, heartbeat, alerted }))));
   try {
-    const totalMinutes = preference.reduce((sum, [, monitor]) => sum + monitor.summary().measuredRuntimeMinutes24h, 0);
-    if (totalMinutes > 60) edmonton.healthWarning(`Combined measured runtime: ${totalMinutes.toFixed(1)} minutes in 24 hours. All scripts share Google's daily runtime quota; review frequency.`);
+    const runtimes = preference.map(([city, monitor]) => ({ city, minutes: monitor.summary().measuredRuntimeMinutes24h }));
+    const totalMinutes = runtimes.reduce((sum, city) => sum + city.minutes, 0);
+    if (totalMinutes > 60) edmonton.healthWarning(`Combined runtime advisory threshold crossed: ${totalMinutes.toFixed(1)} measured minutes in 24 hours (combined advisory threshold: over 60 minutes).\n${runtimes.map(({ city, minutes }) => `${city}: ${minutes.toFixed(1)} minutes`).join("\n")}\nThis is an estimate, not Google's account-wide quota counter. All cities and other scripts share that quota; review runtime before changing frequency. No monitoring schedule has been changed.`, "COMBINED_RUNTIME");
   } catch (error) { errors.push(`Combined health report: ${error.message}`); }
   if (errors.length) throw new Error(`Some cities could not be checked; other cities were still processed. ${errors.join(" | ")}`);
   return results;

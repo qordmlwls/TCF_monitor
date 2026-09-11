@@ -128,13 +128,18 @@ function pingHeartbeat() {
   return history;
 }
 
-function healthWarning(body, channel = "HEALTH") {
+function healthWarning(body, channel = "HEALTH", snapshot = null) {
   const p = properties();
   const warningKey = key(`LAST_${channel}_WARNING_MS`);
   const last = Number(p.getProperty(warningKey) || 0);
   if (Date.now() - last < 6 * 3600000) return;
   try {
-    send(`[TCF ${profile.label} health] Monitoring needs attention`, `${body}\n\nThis is a monitoring warning, not a seat-availability alert.\n${statusText()}`, 5);
+    const isRuntime = ["RUNTIME", "COMBINED_RUNTIME"].includes(channel);
+    const subject = channel === "COMBINED_RUNTIME" ? "[TCF runtime] Combined runtime budget advisory"
+      : isRuntime ? `[TCF ${profile.label} runtime] Runtime budget advisory` : `[TCF ${profile.label} health] Monitoring needs attention`;
+    const notice = isRuntime ? "This is a runtime-budget advisory, not a seat alert or a report that a check failed."
+      : "This is a monitoring warning, not a seat-availability alert.";
+    send(subject, `${body}\n\n${notice}\n${statusText(snapshot?.state, snapshot?.stats)}`, 5);
     p.setProperty(warningKey, String(Date.now()));
   } catch (error) { console.error(`Health email could not be sent: ${safeError(error)}`); }
 }
@@ -199,8 +204,13 @@ function runCheck(dryRun) {
     if (heartbeatDelivery.needsWarning) {
       healthWarning(`Seat check and alert processing succeeded. The independent watchdog delivery needs attention.\nConsecutive delivery failures: ${heartbeatDelivery.failures}. ${heartbeatDelivery.details}`, "HEARTBEAT");
     }
-    if ((result.gapMs || 0) > 15 * 60000 || previousFailures >= 3 || summarize(state).measuredRuntimeMinutes24h > 20) {
-      healthWarning(`Latest check succeeded. Previous gap: ${Math.round((result.gapMs || 0) / 60000)} minutes. Heartbeat: ${heartbeat}.`);
+    if ((result.gapMs || 0) > 15 * 60000 || previousFailures >= 3) {
+      healthWarning(`Latest check succeeded after a monitoring interruption. Previous successful-observation gap: ${Math.round((result.gapMs || 0) / 60000)} minutes. Preceding failed checks: ${previousFailures}. Heartbeat: ${heartbeat}.`);
+    }
+    const stats = summarize(state);
+    if (stats.measuredRuntimeMinutes24h > 20) {
+      healthWarning(`Runtime advisory threshold crossed: ${stats.measuredRuntimeMinutes24h.toFixed(1)} measured minutes in the last 24 hours (city advisory threshold: over 20 minutes).\nLatest check and alert processing succeeded. Heartbeat: ${heartbeat}.\nThis threshold is our early-warning budget, not Google's account-wide quota limit. All cities and other scripts share that quota. No monitoring schedule has been changed.`,
+        "RUNTIME", { state, stats });
     }
     return { ...result, heartbeat };
   } catch (error) {
@@ -233,9 +243,7 @@ function testAlert() {
   console.log("Google accepted the test email. Confirm it arrived in your inbox.");
 }
 
-function statusText() {
-  const state = readState();
-  const stats = summarize(state);
+function statusText(state = readState(), stats = summarize(state)) {
   const c = config();
   let heartbeatDetail = "Heartbeat delivery diagnostics: not recorded yet.";
   try {
