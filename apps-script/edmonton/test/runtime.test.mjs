@@ -16,15 +16,15 @@ function runtime() {
   const messages = [];
   const triggers = [];
   const sheets = new Map();
-  const env = { html: page(row()), http: 200, locked: false, quota: 100, failEmail: false, failLog: false, failPing: false,
-    released: 0, now: Date.parse(at), spreadsheetCreated: 0 };
+  const env = { html: page(row()), http: 200, locked: false, lockHeld: false, quota: 100, failEmail: false, failLog: false, failPing: false,
+    released: 0, now: Date.parse(at), spreadsheetCreated: 0, nextRun: 0 };
   const makeSheet = rows => ({
     rows, setName(name) { sheets.set(name, this); }, setFrozenRows() {},
     appendRow(values) { if (env.failLog) throw new Error("Log write failed"); rows.push([...values]); },
     getLastRow() { return rows.length; }, deleteRows(start, n) { rows.splice(start - 1, n); },
     getRange(r, c, nr = 1, nc = 1) { return {
       getValues() { return Array.from({ length: nr }, (_, i) => (rows[r - 1 + i] || []).slice(c - 1, c - 1 + nc)); },
-      setValues(values) { values.forEach((value, i) => {
+      setValues(values) { if (env.failFinalize && c === 3) throw new Error("Diagnostics unavailable"); values.forEach((value, i) => {
         rows[r - 1 + i] ||= [];
         value.forEach((cell, j) => { rows[r - 1 + i][c - 1 + j] = cell; });
       }); },
@@ -42,10 +42,15 @@ function runtime() {
     Date: Clock,
     console: { log: (...args) => messages.push(args.join(" ")), warn: (...args) => messages.push(args.join(" ")), error: (...args) => messages.push(args.join(" ")) },
     PropertiesService: { getScriptProperties: () => p },
-    LockService: { getScriptLock: () => ({ tryLock: () => !env.locked, releaseLock: () => { env.released += 1; } }) },
+    LockService: { getScriptLock: () => ({ tryLock: () => {
+      if (env.locked || env.lockHeld) return false;
+      env.lockHeld = true; return true;
+    }, releaseLock: () => { env.lockHeld = false; env.released += 1; } }) },
     SpreadsheetApp: { create: () => { env.spreadsheetCreated += 1; return book; }, openById: () => book },
     UrlFetchApp: { fetch: (url, options) => {
       calls.push({ url, options });
+      assert.equal(env.lockHeld, false, "Network calls must never hold the shared script lock");
+      if (env.onFetch) env.onFetch(url);
       const ping = url.startsWith("https://hc-ping.com/");
       if (ping && env.failPing) throw new Error(`Transport failed ${url}`);
       if (ping) {
@@ -62,14 +67,18 @@ function runtime() {
       }
       return { getResponseCode: () => ping ? 200 : env.http, getContentText: () => env.html, getAllHeaders: () => ({ "Content-Type": "text/html; charset=utf-8" }) };
     } },
-    Utilities: { formatDate: (date, zone, pattern) => new Date(date.getTime() - (zone === "America/Toronto" ? 4 : 6) * 3600000).toISOString().slice(0, pattern === "yyyy-MM-dd" ? 10 : 19) },
+    Utilities: { getUuid: () => `test-run-${++env.nextRun}`,
+      formatDate: (date, zone, pattern) => new Date(date.getTime() - (zone === "America/Toronto" ? 4 : 6) * 3600000).toISOString().slice(0, pattern === "yyyy-MM-dd" ? 10 : 19) },
     MailApp: { getRemainingDailyQuota: () => env.quota, sendEmail: email => {
       if (env.failEmail) throw new Error("Email transport failed");
       sent.push(email); env.quota -= 1;
     } },
     ScriptApp: {
       getProjectTriggers: () => [...triggers],
-      deleteTrigger: trigger => { triggers.splice(triggers.indexOf(trigger), 1); },
+      deleteTrigger: trigger => {
+        if (env.failDelete === trigger.getHandlerFunction()) throw new Error("Trigger deletion failed");
+        triggers.splice(triggers.indexOf(trigger), 1);
+      },
       newTrigger: handler => {
         const trigger = { getHandlerFunction: () => handler, handler };
         const builder = { timeBased() { return this; }, everyMinutes(n) { trigger.minutes = n; return this; },
@@ -96,6 +105,177 @@ function multiRuntime() {
   return r;
 }
 
+function seedUnfinished(r, { age = 8 * 60000, withRow = true, legacy = false } = {}) {
+  const started = r.env.now - age, observedAt = new Date(started).toISOString();
+  const run = { id: "terminated-run", started, kind: "CHECK", phase: withRow ? "observation_saved" : "fetching" };
+  if (withRow) {
+    r.rows.push([observedAt, "CHECK", "OBSERVED", 2, 5, 1, 22, 0, 0, "Heartbeat pending.", "[]"]);
+    Object.assign(run, { observedAt, row: r.rows.length });
+  }
+  if (!legacy) r.p.setProperty("TCF_RUN_JOURNAL", JSON.stringify({ version: 1, current: run, interruptions: [] }));
+  return run;
+}
+
+test("a fetching Edmonton check neither holds the shared lock nor prevents other cities from running", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  let nested = false;
+  r.env.onFetch = url => {
+    if (nested || !url.includes("afedmonton")) return;
+    nested = true;
+    assert.equal(r.sandbox.checkEdmonton().outcome, "SKIPPED_OVERLAP");
+    assert.equal(r.sandbox.checkNorthYork({ triggerUid: "ny" }).outcome, "SUCCESS");
+    assert.equal(r.sandbox.checkMontreal({ triggerUid: "mt" }).outcome, "SUCCESS");
+  };
+  r.sandbox.checkEdmonton({ triggerUid: "edm" });
+  assert.equal(nested, true);
+  assert.match(r.rows.at(-1)[9], /Independent timer: checkEdmonton/);
+  assert.match(r.sheets.get("North York").rows.at(-1)[9], /Independent timer: checkNorthYork/);
+  assert.match(r.sheets.get("Montreal").rows.at(-1)[9], /Independent timer: checkMontreal/);
+  assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
+});
+
+test("health audit reconciles a killed run without fetches, heartbeat pings, or notification-state changes", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities();
+  const run = seedUnfinished(r);
+  const state = loadState(r.p), calls = r.calls.length, emails = r.sent.length;
+  r.sandbox.checkMonitorHealth();
+  assert.equal(r.calls.length, calls);
+  assert.deepEqual(loadState(r.p), state);
+  assert.equal(r.rows[run.row - 1][2], "INCOMPLETE");
+  assert.equal(r.rows[run.row - 1][3], 2);
+  assert.match(r.rows[run.row - 1][9], /No seat alert was replayed/);
+  assert.equal(r.sent.length, emails + 1);
+  assert.match(r.sent.at(-1).body, /Completion is unknown/);
+  assert.equal(JSON.parse(r.p.getProperty("TCF_RUN_JOURNAL")).current, null);
+  r.sandbox.checkMonitorHealth();
+  assert.equal(r.sent.length, emails + 1);
+});
+
+test("a fresh city lease is protected from audit and does not block other city timers", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities();
+  const run = seedUnfinished(r, { age: 60000 });
+  const emails = r.sent.length;
+  const results = r.sandbox.checkMonitorHealth();
+  assert.equal(results.find(row => row.city === "Edmonton").outcome, "SKIPPED_OVERLAP");
+  assert.equal(r.rows[run.row - 1][2], "OBSERVED");
+  assert.equal(r.sent.length, emails);
+  assert.equal(r.sandbox.checkNorthYork().outcome, "SUCCESS");
+  assert.equal(r.sandbox.checkMontreal().outcome, "SUCCESS");
+});
+
+test("a killed check before its first observation is detected and the next real check recovers", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities();
+  const state = loadState(r.p); seedUnfinished(r, { withRow: false });
+  r.sandbox.checkEdmonton();
+  assert.deepEqual(loadState(r.p).seen, state.seen);
+  const journal = JSON.parse(r.p.getProperty("TCF_RUN_JOURNAL"));
+  assert.equal(journal.interruptions[0].phase, "fetching");
+  assert.equal(journal.lastFinished.outcome, "SUCCESS");
+  r.sandbox.checkMonitorHealth();
+  assert.match(r.sent.at(-1).body, /Last saved phase: fetching/);
+});
+
+test("old OBSERVED logs are reconciled once; a recent legacy observation is deferred then reconsidered", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities();
+  const old = seedUnfinished(r, { legacy: true });
+  const fresh = seedUnfinished(r, { legacy: true, age: 60000 });
+  r.sandbox.checkMonitorHealth();
+  assert.equal(r.rows[old.row - 1][2], "INCOMPLETE");
+  assert.equal(r.rows[fresh.row - 1][2], "OBSERVED");
+  assert.equal(JSON.parse(r.p.getProperty("TCF_RUN_JOURNAL")).legacyInspected, false);
+  r.env.now += 7 * 60000;
+  r.sandbox.checkMonitorHealth();
+  assert.equal(r.rows[fresh.row - 1][2], "INCOMPLETE");
+  assert.equal(JSON.parse(r.p.getProperty("TCF_RUN_JOURNAL")).interruptions.length, 2);
+  assert.equal(JSON.parse(r.p.getProperty("TCF_RUN_JOURNAL")).legacyInspected, true);
+});
+
+test("audit verifies timestamps and finds rows shifted by retention without corrupting another row", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities();
+  const run = seedUnfinished(r);
+  const original = [...r.rows[run.row - 2]];
+  r.rows.splice(run.row - 1, 0, [...original]);
+  r.sandbox.checkMonitorHealth();
+  assert.deepEqual(r.rows[run.row - 1], original);
+  assert.equal(r.rows[run.row][2], "INCOMPLETE");
+});
+
+test("final log failure is recorded as incomplete and a health audit never repeats sent seats", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities();
+  const seatMails = r.sent.filter(m => m.subject.includes("bookable")).length;
+  r.env.now += 300000; r.env.failFinalize = true;
+  r.sandbox.checkEdmonton();
+  const index = r.rows.length - 1;
+  assert.equal(r.rows[index][2], "OBSERVED");
+  assert.equal(JSON.parse(r.p.getProperty("TCF_RUN_JOURNAL")).interruptions.length, 1);
+  r.env.failFinalize = false;
+  r.sandbox.checkMonitorHealth(); r.sandbox.checkEdmonton();
+  assert.equal(r.rows[index][2], "INCOMPLETE");
+  assert.equal(r.sent.filter(m => m.subject.includes("bookable")).length, seatMails);
+  assert.equal(r.rows.at(-1)[2], "SUCCESS");
+});
+
+test("unfinished-run warnings retry failed email delivery without suppressing coverage warnings", () => {
+  const r = multiRuntime(); r.sandbox.installAllCities(); seedUnfinished(r);
+  r.env.failEmail = true; r.sandbox.checkMonitorHealth();
+  assert.equal(r.p.getProperty("TCF_LAST_RUN_WARNING_MS"), null);
+  r.env.failEmail = false; r.sandbox.checkMonitorHealth();
+  assert.ok(r.p.getProperty("TCF_LAST_RUN_WARNING_MS"));
+  const emails = r.sent.length;
+  r.triggers.splice(r.triggers.findIndex(t => t.handler === "checkEdmonton"), 1);
+  r.sandbox.checkMonitorHealth();
+  assert.equal(r.sent.length, emails + 1);
+  assert.match(r.sent.at(-1).body, /Expected one check trigger; found 0/);
+});
+
+test("legacy timer event migrates to five independent managed timers without resetting state", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities(); r.sandbox.checkAllCities();
+  const state = loadState(r.p), before = r.sent.length;
+  const legacy = { getHandlerFunction: () => "checkAllCities" };
+  const daily = { getHandlerFunction: () => "sendAllDailyReport" };
+  const unrelated = { getHandlerFunction: () => "unrelated" };
+  r.triggers.push(legacy, daily, unrelated);
+  r.sandbox.checkAllCities({ triggerUid: "legacy-id" });
+  assert.equal(r.triggers.length, 6);
+  assert.ok(r.triggers.includes(daily)); assert.ok(r.triggers.includes(unrelated));
+  assert.ok(!r.triggers.includes(legacy));
+  assert.deepEqual(loadState(r.p).seen, state.seen);
+  assert.equal(r.sent.length, before);
+  r.sandbox.migrateToIsolatedChecks();
+  assert.equal(r.triggers.length, 6);
+  assert.ok(r.p.getProperty("TCF_ISOLATED_CHECKS_INSTALLED_AT"));
+});
+
+test("migration creation failure rolls back new timers and preserves the working combined timer", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  const legacy = { getHandlerFunction: () => "checkAllCities" }; r.triggers.push(legacy);
+  r.env.failTrigger = "checkMontreal";
+  r.sandbox.checkAllCities({ triggerUid: "legacy-id" });
+  assert.deepEqual(r.triggers, [legacy]);
+  assert.ok(loadState(r.p).lastSuccess); assert.ok(loadState(r.p, "MONTREAL_STATE_").lastSuccess);
+  r.env.failTrigger = null; r.sandbox.checkAllCities({ triggerUid: "legacy-id" });
+  assert.equal(r.triggers.length, 5);
+});
+
+test("partial legacy deletion failure retains replacement timers and supports idempotent retry", () => {
+  const r = multiRuntime();
+  r.triggers.push({ getHandlerFunction: () => "checkAllCities" }, { getHandlerFunction: () => "sendDailyReport" });
+  r.env.failDelete = "sendDailyReport";
+  assert.throws(() => r.sandbox.migrateToIsolatedChecks(), /deletion/);
+  assert.equal(r.triggers.length, 6);
+  for (const handler of ["checkEdmonton", "checkNorthYork", "checkMontreal", "checkMonitorHealth", "sendAllDailyReport"]) {
+    assert.ok(r.triggers.some(t => t.getHandlerFunction() === handler));
+  }
+  r.env.failDelete = null; r.sandbox.migrateToIsolatedChecks();
+  assert.equal(r.triggers.length, 5);
+});
+
+test("manual combined checks never install or migrate schedules", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities(); r.sandbox.checkAllCities();
+  assert.equal(r.triggers.length, 0);
+  assert.equal(r.p.getProperty("TCF_ISOLATED_CHECKS_INSTALLED_AT"), null);
+});
+
 test("three-city installation upgrades in place, keeps Edmonton history and is idempotent", () => {
   const r = multiRuntime(); r.sandbox.installPilot();
   const history = loadState(r.p).recent.length;
@@ -104,10 +284,13 @@ test("three-city installation upgrades in place, keeps Edmonton history and is i
   assert.equal(r.env.spreadsheetCreated, 1);
   assert.equal(r.sheets.size, 3);
   assert.equal(loadState(r.p).recent.length, history + 2);
-  assert.equal(r.triggers.length, 3);
+  assert.equal(r.triggers.length, 6);
   assert.ok(r.triggers.includes(unrelated));
-  assert.equal(r.triggers.find(t => t.handler === "checkAllCities").minutes, 5);
-  assert.equal(r.triggers.filter(t => t.handler === "checkEdmonton").length, 0);
+  for (const handler of ["checkEdmonton", "checkNorthYork", "checkMontreal"]) {
+    assert.equal(r.triggers.find(t => t.handler === handler).minutes, 5);
+  }
+  assert.equal(r.triggers.find(t => t.handler === "checkMonitorHealth").minutes, 15);
+  assert.equal(r.triggers.filter(t => t.handler === "checkAllCities").length, 0);
   assert.equal(r.sent.filter(m => m.subject.includes("[TCF Montreal]")).length, 1);
   assert.equal(r.p.getProperty("TCF_MONTREAL_LOG_SPREADSHEET_ID"), "test-spreadsheet");
   assert.match(r.sandbox.showAllStatus(), /Preference: North York > Edmonton > Montreal/);
@@ -396,7 +579,7 @@ test("a failed success-state commit cannot advance lastSuccess through error rec
 test("all failure paths release the execution lock", () => {
   const r = runtime(); r.sandbox.dryRun(); const before = r.env.released; r.env.http = 500;
   assert.throws(() => r.sandbox.checkEdmonton());
-  assert.equal(r.env.released, before + 1);
+  assert.equal(r.env.released, before + 2);
 });
 test("health emails are separate from seat alerts and are throttled", () => {
   const r = runtime(); r.env.html = page(row({ bookings: "Closed" })); r.sandbox.dryRun(); r.sandbox.checkEdmonton();

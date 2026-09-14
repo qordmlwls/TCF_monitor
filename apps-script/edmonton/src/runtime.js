@@ -1,6 +1,7 @@
 import { markSent } from "./core.js";
 import { loadState, saveState, summarize } from "./storage.js";
 import { deliverHeartbeat, recordHeartbeat } from "./heartbeat.js";
+import { createRunJournal, RUN_STALE_MS } from "./runs.js";
 
 export function createMonitorRuntime(profile) {
 const PAGE_URL = profile.pageUrl;
@@ -12,6 +13,8 @@ const key = suffix => `${profile.propertyPrefix}${suffix}`;
 const readState = () => loadState(properties(), profile.statePrefix);
 const writeState = state => saveState(properties(), state, profile.statePrefix, profile.maxChunks || 8);
 let activeConfig = null;
+const runs = createRunJournal({ properties, key: key("RUN_JOURNAL"),
+  lock: () => LockService.getScriptLock(), uuid: () => Utilities.getUuid(), now: () => Date.now() });
 
 function properties() { return PropertiesService.getScriptProperties(); }
 function recentChecks(checks) { return checks.filter(check => check.at >= Date.now() - 86400000).slice(-650); }
@@ -144,15 +147,18 @@ function healthWarning(body, channel = "HEALTH", snapshot = null) {
   } catch (error) { console.error(`Health email could not be sent: ${safeError(error)}`); }
 }
 
-function runCheck(dryRun) {
+function runCheck(dryRun, event) {
   const started = Date.now();
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(1000)) {
+  const claim = runs.begin(dryRun ? "DRY_RUN" : "CHECK");
+  if (claim.busy) {
     console.warn("Skipped overlapping check; this is not a successful observation.");
     return { outcome: "SKIPPED_OVERLAP" };
   }
-  let state, sheet, result;
+  const run = claim.run;
+  const execution = event?.triggerUid ? `Independent timer: ${profile.checkHandler}.` : "Manual or combined execution.";
+  let state, sheet, result, loggedRow;
   let recorded = false;
+  let finishOutcome = "FAILED";
   try {
     activeConfig = config();
     sheet = logSheet();
@@ -168,6 +174,7 @@ function runCheck(dryRun) {
       appendCheck(sheet, result);
       console.log(JSON.stringify({ ...result, snapshot: undefined, rows: result.snapshot.length,
         available: result.snapshot.filter(row => row.available).length, note: "Full snapshot saved in the check-history sheet." }));
+      finishOutcome = "DRY_RUN";
       return result;
     }
     state.seen = assessment.next;
@@ -179,9 +186,10 @@ function runCheck(dryRun) {
       writeState(state);
       result.alerted = assessment.events.length;
     }
-    result.details = config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED.";
+    result.details = `${execution} ${config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED."}`;
     result.durationMs = Date.now() - started;
-    const loggedRow = appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+    loggedRow = appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+    runs.observed(run, loggedRow, checkedAt);
     const previousFailures = state.failures;
     const completed = { ...state, lastSuccess: checkedAt, failures: 0, lastRowCount: fetched.rows.length,
       lastAvailableCount: assessment.snapshot.filter(row => row.available).length,
@@ -191,14 +199,16 @@ function runCheck(dryRun) {
     writeState(completed);
     state = completed;
     recorded = true;
+    finishOutcome = "INCOMPLETE";
     const heartbeatDelivery = pingHeartbeat();
     const heartbeat = heartbeatDelivery.status;
     try {
-      result.details = `Heartbeat: ${heartbeat}. ${heartbeatDelivery.details} Consecutive delivery failures: ${heartbeatDelivery.failures}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
+      result.details = `${execution} Heartbeat: ${heartbeat}. ${heartbeatDelivery.details} Consecutive delivery failures: ${heartbeatDelivery.failures}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
       // Finalize the diagnostic columns together to avoid repeated remote sheet calls.
       sheet.getRange(loggedRow, 3, 1, 8).setValues([["SUCCESS", Math.round((Date.now() - started) / 100) / 10,
         result.gapMs === null ? "" : Math.round(result.gapMs / 6000) / 10, result.pages || 0,
         result.snapshot.length, result.snapshot.filter(row => row.available).length, result.alerted, result.details]]);
+      finishOutcome = "SUCCESS";
     } catch (error) { console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`); }
     console.log(JSON.stringify({ ...result, snapshot: undefined, heartbeat, durationMs: Date.now() - started }));
     if (heartbeatDelivery.needsWarning) {
@@ -224,18 +234,81 @@ function runCheck(dryRun) {
       try { writeState(state); } catch (saveError) { console.error(safeError(saveError)); }
     }
     try {
-      if (sheet) appendCheck(sheet, { ...result, checkedAt: new Date().toISOString(), mode: dryRun ? "DRY_RUN" : "CHECK",
+      if (sheet && loggedRow && !recorded) {
+        sheet.getRange(loggedRow, 3).setValue("FAILED");
+        sheet.getRange(loggedRow, 10).setValue(message);
+      } else if (sheet && !recorded) appendCheck(sheet, { ...result, checkedAt: new Date().toISOString(), mode: dryRun ? "DRY_RUN" : "CHECK",
         outcome: "FAILED", durationMs: Date.now() - started, gapMs: null, details: message });
-    } catch (logError) { console.error(`Failed to record check: ${safeError(logError)}`); }
+    } catch (logError) {
+      if (loggedRow) finishOutcome = "INCOMPLETE";
+      console.error(`Failed to record check: ${safeError(logError)}`);
+    }
     if (!dryRun && (!state || state.failures >= 3 || !state.lastSuccess || Date.now() - Date.parse(state.lastSuccess) > 15 * 60000)) healthWarning(message);
     throw new Error(message);
   } finally {
     activeConfig = null;
-    lock.releaseLock();
+    try {
+      if (runs.finish(run, finishOutcome).busy) console.warn("Run completion could not be recorded; health audit will report it as unknown.");
+    } catch (error) { console.error(`Run completion could not be recorded: ${safeError(error)}`); }
   }
 }
 
-function check() { return runCheck(false); }
+function auditRuns() {
+  const claim = runs.begin("AUDIT");
+  if (claim.busy) return { outcome: "SKIPPED_OVERLAP" };
+  let outcome = "AUDIT_FAILED";
+  try {
+    let journal = runs.read();
+    const sheet = logSheet();
+    let recentRows;
+    const scanRecent = () => {
+      if (!recentRows) {
+        const last = sheet.getLastRow(), start = Math.max(2, last - 999);
+        recentRows = (last >= start ? sheet.getRange(start, 1, last - start + 1, 10).getValues() : [])
+          .map((row, i) => ({ row, index: start + i }));
+      }
+      return recentRows;
+    };
+    // A bounded scan also detects observations abandoned before journals existed.
+    if (!journal.legacyInspected) {
+      const observations = scanRecent().filter(({ row }) => row[1] === "CHECK" && row[2] === "OBSERVED" && Number.isFinite(Date.parse(row[0])));
+      const legacy = observations.filter(({ row }) => Date.now() - Date.parse(row[0]) > RUN_STALE_MS)
+        .map(({ row, index }) => ({ id: `legacy:${row[0]}`, started: Date.parse(row[0]), observedAt: row[0], row: index, phase: "legacy_observation" }));
+      // A recent pre-upgrade observation may still finish; revisit it on the next audit.
+      if (runs.importLegacy(legacy, legacy.length === observations.length).busy) return { outcome: "SKIPPED_OVERLAP" };
+      journal = runs.read();
+    }
+    for (const item of journal.interruptions.filter(item => !item.reconciled)) {
+      if (item.row && item.observedAt) {
+        let index = item.row;
+        let row = index <= sheet.getLastRow() ? sheet.getRange(index, 1, 1, 10).getValues()[0] : [];
+        // Retention can shift row numbers; verify identity before touching a historical row.
+        if (row[0] !== item.observedAt) {
+          const found = scanRecent().find(entry => entry.row[0] === item.observedAt && entry.row[1] === "CHECK");
+          row = found?.row || []; index = found?.index;
+        }
+        if (row[0] === item.observedAt && row[1] === "CHECK" && row[2] === "OBSERVED") {
+          sheet.getRange(index, 10).setValue(`Completion unknown. This run did not finalize its log. Observed at ${item.observedAt}; detected ${new Date(item.detected).toISOString()}. Recorded runtime is only a lower bound. No seat alert was replayed.`);
+          sheet.getRange(index, 3).setValue("INCOMPLETE");
+        }
+      }
+      if (runs.acknowledge(item.id).busy) throw new Error("Could not record unfinished-run reconciliation; retry next audit.");
+    }
+    const latest = journal.interruptions[journal.interruptions.length - 1];
+    if (latest && latest.detected > Number(properties().getProperty(key("LAST_RUN_WARNING_MS")) || 0)) {
+      healthWarning(`An unfinished ${profile.label} run was detected. Started (UTC): ${new Date(latest.started).toISOString()}. Last saved phase: ${latest.phase}. Completion is unknown; this does not mean seats were sold out. Notification history was preserved and no old seat alerts were replayed.`, "RUN");
+    }
+    const enabled = ScriptApp.getProjectTriggers().filter(t => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
+    const stats = summarize(readState());
+    if (enabled !== 1 || stats.minutesSinceSuccess === null || stats.minutesSinceSuccess > 15) {
+      healthWarning(`Monitoring coverage needs attention. Expected one check trigger; found ${enabled}. Minutes since a successful observation: ${stats.minutesSinceSuccess ?? "UNKNOWN"}.`, "COVERAGE");
+    }
+    outcome = "AUDITED";
+    return { outcome, incompleteRunsRetained: journal.interruptions.length };
+  } finally { runs.finish(claim.run, outcome); }
+}
+
+function check(event) { return runCheck(false, event); }
 function dryRun() { ensureLog(); return runCheck(true); }
 
 function testAlert() {
@@ -255,6 +328,14 @@ function statusText(state = readState(), stats = summarize(state)) {
       `Last recovery (UTC): ${h.lastRecoveryAt || "NONE RECORDED"}`].join("\n");
   } catch (_) { heartbeatDetail = "Heartbeat delivery diagnostics could not be read; inspect execution logs."; }
   const enabled = ScriptApp.getProjectTriggers().filter(t => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
+  let runDetail;
+  try {
+    const journal = runs.read(), latest = journal.interruptions[journal.interruptions.length - 1];
+    runDetail = [`Run tracking: ${journal.current ? `${journal.current.kind} IN PROGRESS since ${new Date(journal.current.started).toISOString()}${Date.now() - journal.current.started > RUN_STALE_MS ? "; OVERDUE - completion unknown" : ""}` : "no active run recorded"}`,
+      `Last finalized run: ${journal.lastFinished ? `${new Date(journal.lastFinished.at).toISOString()}; ${journal.lastFinished.kind}; ${journal.lastFinished.outcome}` : "NONE RECORDED"}`,
+      `Recorded incomplete runs in last 24 hours: ${journal.interruptions.filter(item => item.detected >= Date.now() - 86400000).length}${journal.truncatedAt >= Date.now() - 86400000 ? " or more (history bounded)" : ""}`,
+      `Last incomplete run: ${latest ? `${new Date(latest.started).toISOString()}; ${latest.phase}; completion unknown` : "NONE RECORDED"}`].join("\n");
+  } catch (_) { runDetail = "Run tracking unavailable; inspect execution logs."; }
   return [`TCF ${profile.label} monitor health (not a seat alert)`, "",
     `Five-minute check triggers: ${enabled} (expected 1)`,
     `Last successful check (UTC): ${stats.lastSuccess || "NONE"}`,
@@ -265,6 +346,7 @@ function statusText(state = readState(), stats = summarize(state)) {
     `Last recorded check failure (UTC): ${state.lastCheckFailure ? `${state.lastCheckFailure.at}; ${state.lastCheckFailure.details}` : "NONE RECORDED"}`,
     `Last check recovery (UTC): ${state.lastCheckRecovery ? `${state.lastCheckRecovery.at}; observation gap: ${state.lastCheckRecovery.gapMinutes ?? "UNKNOWN"} minutes` : "NONE RECORDED"}`,
     `Longest observed gap in last 24 hours: ${stats.longestGapMinutes24h} minutes`,
+    runDetail,
     `Measured check runtime in last 24 hours: ${stats.measuredRuntimeMinutes24h} minutes`,
     `Average check runtime: ${stats.averageRuntimeSeconds24h ?? "UNKNOWN"} seconds`,
     "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
@@ -316,5 +398,5 @@ function testWatchdogFailure() {
 }
 
 return { check, dryRun, testAlert, showStatus, statusText, sendDailyReport, installPilot, stopPilot, testWatchdogFailure,
-  ensureLog, summary: () => summarize(readState()), send, config, healthWarning };
+  ensureLog, auditRuns, summary: () => summarize(readState()), send, config, healthWarning };
 }

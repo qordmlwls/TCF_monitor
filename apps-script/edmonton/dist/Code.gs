@@ -578,12 +578,16 @@ var EdmontonMonitor = (() => {
   __export(apps_script_exports, {
     checkAllCities: () => checkAllCities,
     checkEdmonton: () => checkEdmonton,
+    checkMonitorHealth: () => checkMonitorHealth,
+    checkMontreal: () => checkMontreal,
+    checkNorthYork: () => checkNorthYork,
     dryRun: () => dryRun,
     dryRunAllCities: () => dryRunAllCities,
     dryRunMontreal: () => dryRunMontreal,
     dryRunNorthYork: () => dryRunNorthYork,
     installAllCities: () => installAllCities,
     installPilot: () => installPilot,
+    migrateToIsolatedChecks: () => migrateToIsolatedChecks,
     sendAllDailyReport: () => sendAllDailyReport,
     sendDailyReport: () => sendDailyReport,
     showAllStatus: () => showAllStatus,
@@ -3897,6 +3901,100 @@ var EdmontonMonitor = (() => {
     };
   }
 
+  // src/runs.js
+  var RUN_STALE_MS = 7 * 6e4;
+  var RETAIN_INTERRUPTION_MS = 7 * 864e5;
+  var MAX_INTERRUPTION_RECORDS = 20;
+  function createRunJournal({ properties, key, lock, now = Date.now, uuid }) {
+    function read() {
+      const value = properties().getProperty(key);
+      if (!value) return { version: 1, current: null, interruptions: [] };
+      const journal = JSON.parse(value);
+      if (!journal || journal.version !== 1 || !Array.isArray(journal.interruptions) || journal.interruptions.some((item) => !item || !item.id || !Number.isFinite(item.started) || !Number.isFinite(item.detected)) || journal.current && (!journal.current.id || !Number.isFinite(journal.current.started))) {
+        throw new Error("Invalid run journal; refusing concurrent checks.");
+      }
+      return journal;
+    }
+    function change(fn) {
+      const guard = lock();
+      if (!guard.tryLock(1e3)) return { busy: true };
+      try {
+        const journal = read();
+        const result = fn(journal);
+        if (result?.write !== false) properties().setProperty(key, JSON.stringify(journal));
+        return result;
+      } finally {
+        guard.releaseLock();
+      }
+    }
+    function interrupt(journal, run) {
+      if (!journal.interruptions.some((item) => item.id === run.id || run.observedAt && item.observedAt === run.observedAt)) {
+        journal.interruptions.push({
+          id: run.id,
+          started: run.started,
+          observedAt: run.observedAt,
+          row: run.row,
+          phase: run.phase,
+          detected: now()
+        });
+        journal.interruptions = journal.interruptions.filter((item) => item.detected >= now() - RETAIN_INTERRUPTION_MS);
+        if (journal.interruptions.length > MAX_INTERRUPTION_RECORDS) {
+          journal.truncatedAt = now();
+          journal.interruptions = journal.interruptions.slice(-MAX_INTERRUPTION_RECORDS);
+        }
+      }
+    }
+    function expire(journal) {
+      if (journal.current && now() - journal.current.started > RUN_STALE_MS) {
+        interrupt(journal, journal.current);
+        journal.current = null;
+      }
+    }
+    return {
+      read,
+      begin(kind = "CHECK") {
+        return change((journal) => {
+          expire(journal);
+          if (journal.current) return { busy: true, write: false };
+          const run = { id: uuid(), started: now(), phase: kind === "CHECK" ? "fetching" : kind.toLowerCase(), kind };
+          journal.current = run;
+          return { run };
+        });
+      },
+      observed(run, row, observedAt) {
+        const result = change((journal) => {
+          if (journal.current?.id !== run.id) throw new Error("Check no longer owns its run lease.");
+          Object.assign(journal.current, { row, observedAt, phase: "observation_saved" });
+          return { updated: true };
+        });
+        if (result.busy) throw new Error("Could not save the run observation checkpoint.");
+      },
+      finish(run, outcome) {
+        return change((journal) => {
+          if (journal.current?.id !== run.id) return { write: false };
+          if (outcome === "INCOMPLETE") interrupt(journal, journal.current);
+          journal.lastFinished = { at: now(), outcome, started: run.started, kind: run.kind };
+          journal.current = null;
+          return { finished: true };
+        });
+      },
+      importLegacy(runs, complete = true) {
+        return change((journal) => {
+          for (const run of runs) interrupt(journal, run);
+          journal.legacyInspected = complete;
+          return { imported: true };
+        });
+      },
+      acknowledge(id) {
+        return change((journal) => {
+          const item = journal.interruptions.find((item2) => item2.id === id);
+          if (item) item.reconciled = true;
+          return { acknowledged: true };
+        });
+      }
+    };
+  }
+
   // src/runtime.js
   function createMonitorRuntime(profile) {
     const PAGE_URL2 = profile.pageUrl;
@@ -3919,6 +4017,13 @@ var EdmontonMonitor = (() => {
     const readState = () => loadState(properties(), profile.statePrefix);
     const writeState = (state) => saveState(properties(), state, profile.statePrefix, profile.maxChunks || 8);
     let activeConfig = null;
+    const runs = createRunJournal({
+      properties,
+      key: key("RUN_JOURNAL"),
+      lock: () => LockService.getScriptLock(),
+      uuid: () => Utilities.getUuid(),
+      now: () => Date.now()
+    });
     function properties() {
       return PropertiesService.getScriptProperties();
     }
@@ -4071,15 +4176,18 @@ ${statusText(snapshot?.state, snapshot?.stats)}`, 5);
         console.error(`Health email could not be sent: ${safeError(error)}`);
       }
     }
-    function runCheck(dryRun3) {
+    function runCheck(dryRun3, event) {
       const started = Date.now();
-      const lock = LockService.getScriptLock();
-      if (!lock.tryLock(1e3)) {
+      const claim = runs.begin(dryRun3 ? "DRY_RUN" : "CHECK");
+      if (claim.busy) {
         console.warn("Skipped overlapping check; this is not a successful observation.");
         return { outcome: "SKIPPED_OVERLAP" };
       }
-      let state, sheet, result;
+      const run = claim.run;
+      const execution = event?.triggerUid ? `Independent timer: ${profile.checkHandler}.` : "Manual or combined execution.";
+      let state, sheet, result, loggedRow;
       let recorded = false;
+      let finishOutcome = "FAILED";
       try {
         activeConfig = config();
         sheet = logSheet();
@@ -4107,6 +4215,7 @@ ${statusText(snapshot?.state, snapshot?.stats)}`, 5);
             available: result.snapshot.filter((row) => row.available).length,
             note: "Full snapshot saved in the check-history sheet."
           }));
+          finishOutcome = "DRY_RUN";
           return result;
         }
         state.seen = assessment.next;
@@ -4117,9 +4226,10 @@ ${statusText(snapshot?.state, snapshot?.stats)}`, 5);
           writeState(state);
           result.alerted = assessment.events.length;
         }
-        result.details = config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED.";
+        result.details = `${execution} ${config().heartbeat ? "Heartbeat pending." : "External watchdog NOT CONFIGURED."}`;
         result.durationMs = Date.now() - started;
-        const loggedRow = appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+        loggedRow = appendCheck(sheet, { ...result, outcome: "OBSERVED" });
+        runs.observed(run, loggedRow, checkedAt);
         const previousFailures = state.failures;
         const completed = {
           ...state,
@@ -4136,10 +4246,11 @@ ${statusText(snapshot?.state, snapshot?.stats)}`, 5);
         writeState(completed);
         state = completed;
         recorded = true;
+        finishOutcome = "INCOMPLETE";
         const heartbeatDelivery = pingHeartbeat();
         const heartbeat = heartbeatDelivery.status;
         try {
-          result.details = `Heartbeat: ${heartbeat}. ${heartbeatDelivery.details} Consecutive delivery failures: ${heartbeatDelivery.failures}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
+          result.details = `${execution} Heartbeat: ${heartbeat}. ${heartbeatDelivery.details} Consecutive delivery failures: ${heartbeatDelivery.failures}. Changed rows: ${assessment.changes.length}. ${fetched.detail || ""}`;
           sheet.getRange(loggedRow, 3, 1, 8).setValues([[
             "SUCCESS",
             Math.round((Date.now() - started) / 100) / 10,
@@ -4150,6 +4261,7 @@ ${statusText(snapshot?.state, snapshot?.stats)}`, 5);
             result.alerted,
             result.details
           ]]);
+          finishOutcome = "SUCCESS";
         } catch (error) {
           console.warn(`Post-check diagnostics could not be updated: ${safeError(error)}`);
         }
@@ -4187,7 +4299,10 @@ This threshold is our early-warning budget, not Google's account-wide quota limi
           }
         }
         try {
-          if (sheet) appendCheck(sheet, {
+          if (sheet && loggedRow && !recorded) {
+            sheet.getRange(loggedRow, 3).setValue("FAILED");
+            sheet.getRange(loggedRow, 10).setValue(message);
+          } else if (sheet && !recorded) appendCheck(sheet, {
             ...result,
             checkedAt: (/* @__PURE__ */ new Date()).toISOString(),
             mode: dryRun3 ? "DRY_RUN" : "CHECK",
@@ -4197,17 +4312,74 @@ This threshold is our early-warning budget, not Google's account-wide quota limi
             details: message
           });
         } catch (logError) {
+          if (loggedRow) finishOutcome = "INCOMPLETE";
           console.error(`Failed to record check: ${safeError(logError)}`);
         }
         if (!dryRun3 && (!state || state.failures >= 3 || !state.lastSuccess || Date.now() - Date.parse(state.lastSuccess) > 15 * 6e4)) healthWarning(message);
         throw new Error(message);
       } finally {
         activeConfig = null;
-        lock.releaseLock();
+        try {
+          if (runs.finish(run, finishOutcome).busy) console.warn("Run completion could not be recorded; health audit will report it as unknown.");
+        } catch (error) {
+          console.error(`Run completion could not be recorded: ${safeError(error)}`);
+        }
       }
     }
-    function check() {
-      return runCheck(false);
+    function auditRuns() {
+      const claim = runs.begin("AUDIT");
+      if (claim.busy) return { outcome: "SKIPPED_OVERLAP" };
+      let outcome = "AUDIT_FAILED";
+      try {
+        let journal = runs.read();
+        const sheet = logSheet();
+        let recentRows;
+        const scanRecent = () => {
+          if (!recentRows) {
+            const last = sheet.getLastRow(), start = Math.max(2, last - 999);
+            recentRows = (last >= start ? sheet.getRange(start, 1, last - start + 1, 10).getValues() : []).map((row, i) => ({ row, index: start + i }));
+          }
+          return recentRows;
+        };
+        if (!journal.legacyInspected) {
+          const observations = scanRecent().filter(({ row }) => row[1] === "CHECK" && row[2] === "OBSERVED" && Number.isFinite(Date.parse(row[0])));
+          const legacy = observations.filter(({ row }) => Date.now() - Date.parse(row[0]) > RUN_STALE_MS).map(({ row, index }) => ({ id: `legacy:${row[0]}`, started: Date.parse(row[0]), observedAt: row[0], row: index, phase: "legacy_observation" }));
+          if (runs.importLegacy(legacy, legacy.length === observations.length).busy) return { outcome: "SKIPPED_OVERLAP" };
+          journal = runs.read();
+        }
+        for (const item of journal.interruptions.filter((item2) => !item2.reconciled)) {
+          if (item.row && item.observedAt) {
+            let index = item.row;
+            let row = index <= sheet.getLastRow() ? sheet.getRange(index, 1, 1, 10).getValues()[0] : [];
+            if (row[0] !== item.observedAt) {
+              const found = scanRecent().find((entry) => entry.row[0] === item.observedAt && entry.row[1] === "CHECK");
+              row = found?.row || [];
+              index = found?.index;
+            }
+            if (row[0] === item.observedAt && row[1] === "CHECK" && row[2] === "OBSERVED") {
+              sheet.getRange(index, 10).setValue(`Completion unknown. This run did not finalize its log. Observed at ${item.observedAt}; detected ${new Date(item.detected).toISOString()}. Recorded runtime is only a lower bound. No seat alert was replayed.`);
+              sheet.getRange(index, 3).setValue("INCOMPLETE");
+            }
+          }
+          if (runs.acknowledge(item.id).busy) throw new Error("Could not record unfinished-run reconciliation; retry next audit.");
+        }
+        const latest = journal.interruptions[journal.interruptions.length - 1];
+        if (latest && latest.detected > Number(properties().getProperty(key("LAST_RUN_WARNING_MS")) || 0)) {
+          healthWarning(`An unfinished ${profile.label} run was detected. Started (UTC): ${new Date(latest.started).toISOString()}. Last saved phase: ${latest.phase}. Completion is unknown; this does not mean seats were sold out. Notification history was preserved and no old seat alerts were replayed.`, "RUN");
+        }
+        const enabled = ScriptApp.getProjectTriggers().filter((t) => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
+        const stats = summarize(readState());
+        if (enabled !== 1 || stats.minutesSinceSuccess === null || stats.minutesSinceSuccess > 15) {
+          healthWarning(`Monitoring coverage needs attention. Expected one check trigger; found ${enabled}. Minutes since a successful observation: ${stats.minutesSinceSuccess ?? "UNKNOWN"}.`, "COVERAGE");
+        }
+        outcome = "AUDITED";
+        return { outcome, incompleteRunsRetained: journal.interruptions.length };
+      } finally {
+        runs.finish(claim.run, outcome);
+      }
+    }
+    function check(event) {
+      return runCheck(false, event);
     }
     function dryRun2() {
       ensureLog();
@@ -4236,6 +4408,18 @@ Running this test does not start scheduled monitoring.`);
         heartbeatDetail = "Heartbeat delivery diagnostics could not be read; inspect execution logs.";
       }
       const enabled = ScriptApp.getProjectTriggers().filter((t) => [profile.checkHandler, "checkAllCities"].includes(t.getHandlerFunction())).length;
+      let runDetail;
+      try {
+        const journal = runs.read(), latest = journal.interruptions[journal.interruptions.length - 1];
+        runDetail = [
+          `Run tracking: ${journal.current ? `${journal.current.kind} IN PROGRESS since ${new Date(journal.current.started).toISOString()}${Date.now() - journal.current.started > RUN_STALE_MS ? "; OVERDUE - completion unknown" : ""}` : "no active run recorded"}`,
+          `Last finalized run: ${journal.lastFinished ? `${new Date(journal.lastFinished.at).toISOString()}; ${journal.lastFinished.kind}; ${journal.lastFinished.outcome}` : "NONE RECORDED"}`,
+          `Recorded incomplete runs in last 24 hours: ${journal.interruptions.filter((item) => item.detected >= Date.now() - 864e5).length}${journal.truncatedAt >= Date.now() - 864e5 ? " or more (history bounded)" : ""}`,
+          `Last incomplete run: ${latest ? `${new Date(latest.started).toISOString()}; ${latest.phase}; completion unknown` : "NONE RECORDED"}`
+        ].join("\n");
+      } catch (_) {
+        runDetail = "Run tracking unavailable; inspect execution logs.";
+      }
       return [
         `TCF ${profile.label} monitor health (not a seat alert)`,
         "",
@@ -4248,6 +4432,7 @@ Running this test does not start scheduled monitoring.`);
         `Last recorded check failure (UTC): ${state.lastCheckFailure ? `${state.lastCheckFailure.at}; ${state.lastCheckFailure.details}` : "NONE RECORDED"}`,
         `Last check recovery (UTC): ${state.lastCheckRecovery ? `${state.lastCheckRecovery.at}; observation gap: ${state.lastCheckRecovery.gapMinutes ?? "UNKNOWN"} minutes` : "NONE RECORDED"}`,
         `Longest observed gap in last 24 hours: ${stats.longestGapMinutes24h} minutes`,
+        runDetail,
         `Measured check runtime in last 24 hours: ${stats.measuredRuntimeMinutes24h} minutes`,
         `Average check runtime: ${stats.averageRuntimeSeconds24h ?? "UNKNOWN"} seconds`,
         "Runtime is an estimate, not Google's account-wide quota counter; other scripts and reporting use additional time.",
@@ -4309,6 +4494,7 @@ Running this test does not start scheduled monitoring.`);
       stopPilot: stopPilot2,
       testWatchdogFailure: testWatchdogFailure2,
       ensureLog,
+      auditRuns,
       summary: () => summarize(readState()),
       send,
       config,
@@ -4359,10 +4545,17 @@ Running this test does not start scheduled monitoring.`);
     alertBody: preferredAlertBody
   });
   var preference = [["North York", northYork], ["Edmonton", edmonton], ["Montreal", montreal]];
-  var allHandlers = ["checkAllCities", "sendAllDailyReport", "checkEdmonton", "sendDailyReport"];
-  var hasAllTrigger = () => ScriptApp.getProjectTriggers().some((t) => t.getHandlerFunction() === "checkAllCities");
-  function checkEdmonton() {
-    return edmonton.check();
+  var isolatedHandlers = ["checkEdmonton", "checkNorthYork", "checkMontreal"];
+  var allHandlers = ["checkAllCities", "sendAllDailyReport", "sendDailyReport", "checkMonitorHealth", ...isolatedHandlers];
+  var hasAllTrigger = () => ScriptApp.getProjectTriggers().some((t) => ["checkAllCities", "checkNorthYork", "checkMontreal"].includes(t.getHandlerFunction()));
+  function checkEdmonton(event) {
+    return edmonton.check(event);
+  }
+  function checkNorthYork(event) {
+    return northYork.check(event);
+  }
+  function checkMontreal(event) {
+    return montreal.check(event);
   }
   function dryRun() {
     return edmonton.dryRun();
@@ -4401,7 +4594,14 @@ Running this test does not start scheduled monitoring.`);
     edmonton.ensureLog();
     return preference.map(([city, monitor]) => ({ city, ...monitor.dryRun() }));
   }
-  function checkAllCities() {
+  function checkAllCities(event) {
+    if (event?.triggerUid) {
+      try {
+        migrateToIsolatedChecks();
+      } catch (error) {
+        console.error(`Schedule migration needs retry; continuing this combined check: ${error.message}`);
+      }
+    }
     const results = [], errors = [];
     for (const [city, monitor] of [["Edmonton", edmonton], ["North York", northYork], ["Montreal", montreal]]) {
       try {
@@ -4422,6 +4622,56 @@ This is an estimate, not Google's account-wide quota counter. All cities and oth
     }
     if (errors.length) throw new Error(`Some cities could not be checked; other cities were still processed. ${errors.join(" | ")}`);
     return results;
+  }
+  function checkMonitorHealth() {
+    const results = [], errors = [];
+    for (const [city, monitor] of preference) {
+      try {
+        results.push({ city, ...monitor.auditRuns() });
+      } catch (error) {
+        errors.push(`${city}: ${error.message}`);
+      }
+    }
+    try {
+      const total = preference.reduce((sum, [, monitor]) => sum + monitor.summary().measuredRuntimeMinutes24h, 0);
+      if (total > 60) edmonton.healthWarning(`Combined runtime advisory threshold crossed: ${total.toFixed(1)} measured minutes in 24 hours. All cities still share Google's account quota. No monitoring schedule has been changed.`, "COMBINED_RUNTIME");
+    } catch (error) {
+      errors.push(`Combined runtime: ${error.message}`);
+    }
+    console.log(JSON.stringify(results));
+    if (errors.length) throw new Error(`Monitor health audit: ${errors.join(" | ")}`);
+    return results;
+  }
+  function migrateToIsolatedChecks() {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(1e3)) throw new Error("Schedule migration is busy; retry on the next combined check.");
+    const created = [];
+    let removalStarted = false;
+    try {
+      const existing = ScriptApp.getProjectTriggers();
+      for (const handler of [...isolatedHandlers, "checkMonitorHealth", "sendAllDailyReport"]) {
+        if (existing.some((t) => t.getHandlerFunction() === handler)) continue;
+        const timer = ScriptApp.newTrigger(handler).timeBased();
+        created.push(handler === "sendAllDailyReport" ? timer.atHour(18).everyDays(1).inTimezone("America/Edmonton").create() : timer.everyMinutes(handler === "checkMonitorHealth" ? 15 : 5).create());
+      }
+      removalStarted = true;
+      const kept = /* @__PURE__ */ new Set();
+      for (const trigger of ScriptApp.getProjectTriggers()) {
+        const handler = trigger.getHandlerFunction();
+        if (!allHandlers.includes(handler)) continue;
+        if (["checkAllCities", "sendDailyReport"].includes(handler) || kept.has(handler)) ScriptApp.deleteTrigger(trigger);
+        else kept.add(handler);
+      }
+      PropertiesService.getScriptProperties().setProperty("TCF_ISOLATED_CHECKS_INSTALLED_AT", (/* @__PURE__ */ new Date()).toISOString());
+      return { outcome: "ISOLATED", handlers: [...kept] };
+    } catch (error) {
+      if (!removalStarted) {
+        for (const trigger of created) ScriptApp.deleteTrigger(trigger);
+      }
+      throw error;
+    } finally {
+      lock.releaseLock();
+    }
   }
   function allStatusText() {
     return [
@@ -4445,7 +4695,8 @@ This is an estimate, not Google's account-wide quota counter. All cities and oth
     const old = ScriptApp.getProjectTriggers().filter((t) => allHandlers.includes(t.getHandlerFunction()));
     const created = [];
     try {
-      created.push(ScriptApp.newTrigger("checkAllCities").timeBased().everyMinutes(5).create());
+      for (const handler of isolatedHandlers) created.push(ScriptApp.newTrigger(handler).timeBased().everyMinutes(5).create());
+      created.push(ScriptApp.newTrigger("checkMonitorHealth").timeBased().everyMinutes(15).create());
       created.push(ScriptApp.newTrigger("sendAllDailyReport").timeBased().atHour(18).everyDays(1).inTimezone("America/Edmonton").create());
     } catch (error) {
       created.forEach((t) => ScriptApp.deleteTrigger(t));
@@ -4454,7 +4705,7 @@ This is an estimate, not Google's account-wide quota counter. All cities and oth
     old.forEach((t) => ScriptApp.deleteTrigger(t));
     PropertiesService.getScriptProperties().setProperty("TCF_ALL_CITIES_INSTALLED_AT", (/* @__PURE__ */ new Date()).toISOString());
     checkAllCities();
-    edmonton.send("[TCF health] Three-centre five-minute monitor installed", allStatusText(), 5);
+    edmonton.send("[TCF health] Independent five-minute city checks installed", allStatusText(), 5);
     return showAllStatus();
   }
   function stopAllCities() {
@@ -4464,21 +4715,25 @@ This is an estimate, not Google's account-wide quota counter. All cities and oth
   return __toCommonJS(apps_script_exports);
 })();
 
-function installAllCities() { return EdmontonMonitor.installAllCities(); }
-function dryRunAllCities() { return EdmontonMonitor.dryRunAllCities(); }
-function checkAllCities() { return EdmontonMonitor.checkAllCities(); }
-function showAllStatus() { return EdmontonMonitor.showAllStatus(); }
-function sendAllDailyReport() { return EdmontonMonitor.sendAllDailyReport(); }
-function stopAllCities() { return EdmontonMonitor.stopAllCities(); }
-function dryRunNorthYork() { return EdmontonMonitor.dryRunNorthYork(); }
-function dryRunMontreal() { return EdmontonMonitor.dryRunMontreal(); }
-function testNorthYorkWatchdog() { return EdmontonMonitor.testNorthYorkWatchdog(); }
-function testMontrealWatchdog() { return EdmontonMonitor.testMontrealWatchdog(); }
-function installPilot() { return EdmontonMonitor.installPilot(); }
-function dryRun() { return EdmontonMonitor.dryRun(); }
-function testAlert() { return EdmontonMonitor.testAlert(); }
-function checkEdmonton() { return EdmontonMonitor.checkEdmonton(); }
-function showStatus() { return EdmontonMonitor.showStatus(); }
-function sendDailyReport() { return EdmontonMonitor.sendDailyReport(); }
-function stopPilot() { return EdmontonMonitor.stopPilot(); }
-function testWatchdogFailure() { return EdmontonMonitor.testWatchdogFailure(); }
+function installAllCities(event) { return EdmontonMonitor.installAllCities(event); }
+function dryRunAllCities(event) { return EdmontonMonitor.dryRunAllCities(event); }
+function checkAllCities(event) { return EdmontonMonitor.checkAllCities(event); }
+function showAllStatus(event) { return EdmontonMonitor.showAllStatus(event); }
+function sendAllDailyReport(event) { return EdmontonMonitor.sendAllDailyReport(event); }
+function stopAllCities(event) { return EdmontonMonitor.stopAllCities(event); }
+function checkNorthYork(event) { return EdmontonMonitor.checkNorthYork(event); }
+function checkMontreal(event) { return EdmontonMonitor.checkMontreal(event); }
+function checkMonitorHealth(event) { return EdmontonMonitor.checkMonitorHealth(event); }
+function migrateToIsolatedChecks(event) { return EdmontonMonitor.migrateToIsolatedChecks(event); }
+function dryRunNorthYork(event) { return EdmontonMonitor.dryRunNorthYork(event); }
+function dryRunMontreal(event) { return EdmontonMonitor.dryRunMontreal(event); }
+function testNorthYorkWatchdog(event) { return EdmontonMonitor.testNorthYorkWatchdog(event); }
+function testMontrealWatchdog(event) { return EdmontonMonitor.testMontrealWatchdog(event); }
+function installPilot(event) { return EdmontonMonitor.installPilot(event); }
+function dryRun(event) { return EdmontonMonitor.dryRun(event); }
+function testAlert(event) { return EdmontonMonitor.testAlert(event); }
+function checkEdmonton(event) { return EdmontonMonitor.checkEdmonton(event); }
+function showStatus(event) { return EdmontonMonitor.showStatus(event); }
+function sendDailyReport(event) { return EdmontonMonitor.sendDailyReport(event); }
+function stopPilot(event) { return EdmontonMonitor.stopPilot(event); }
+function testWatchdogFailure(event) { return EdmontonMonitor.testWatchdogFailure(event); }

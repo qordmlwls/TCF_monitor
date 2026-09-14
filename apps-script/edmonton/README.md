@@ -21,8 +21,9 @@ modified. North York means that campus specifically, not all Toronto campuses.
 4. Set `TCF_NORTH_YORK_HEALTHCHECKS_URL` and `TCF_MONTREAL_HEALTHCHECKS_URL` to their
    respective private ping URLs. Keep `TCF_HEALTHCHECKS_URL` unchanged for Edmonton.
 5. Run `installAllCities`. It validates all providers before replacing the old
-   Edmonton triggers with `checkAllCities` every five minutes and
-   `sendAllDailyReport` once daily. It preserves Edmonton's state and `Checks` sheet.
+   Edmonton triggers with three independent five-minute timers (`checkEdmonton`,
+   `checkNorthYork`, `checkMontreal`), `checkMonitorHealth` every 15 minutes, and
+   `sendAllDailyReport` once daily. It preserves all notification state and sheets.
 6. Verify automatic executions, all three city sheets in the existing private
    spreadsheet, all three independent watchdogs, and email delivery. Initial
    currently open sessions produce real availability emails.
@@ -37,7 +38,10 @@ Once the all-city schedule exists, it reinstalls the all-city schedule instead.
 | --- | --- |
 | `installAllCities` | Validates all three, replaces only managed triggers, checks immediately. |
 | `dryRunAllCities` | Logs each city's snapshot without email, notification-state changes or heartbeat. |
-| `checkAllCities` | Performs real checks; a city error is recorded without skipping the other cities. |
+| `checkAllCities` | Manual sequential checks; ordinary city errors do not skip the others. Not the new scheduled handler. |
+| `checkEdmonton`, `checkNorthYork`, `checkMontreal` | Independent real city checks; scheduled every five minutes. |
+| `checkMonitorHealth` | Reconciles unfinished runs and checks coverage without fetching seats or pinging success; every 15 minutes. |
+| `migrateToIsolatedChecks` | Replaces the combined schedule with independent timers without resetting state or fetching providers. |
 | `showAllStatus` | Shows each city's health and check-history link, in preference order. |
 | `sendAllDailyReport` | Sends one combined health report. |
 | `dryRunNorthYork`, `dryRunMontreal` | Checks just the named added provider without alerting. |
@@ -48,6 +52,32 @@ New state is stored separately under `NORTH_YORK_STATE_*` and `MONTREAL_STATE_*`
 New diagnostic properties use `TCF_NORTH_YORK_*` and `TCF_MONTREAL_*`. These are
 managed automatically; do not edit or delete them. The separate `North York`
 and `Montreal` sheets use the same log format and retention as Edmonton's `Checks`.
+
+### Existing Three-City Schedule Migration
+
+Uploading this version to an already running three-city project upgrades its
+schedule on the next existing `checkAllCities` timer invocation. The timer event
+is forwarded through the generated entry point; manual checks do not activate
+migration. All replacement timers are created before the legacy timer is removed.
+Creation failure rolls back newly created timers and leaves the legacy timer in
+place for retry. Once deletion starts, replacement timers are retained even if
+cleanup fails. `migrateToIsolatedChecks` can be run again to finish cleanup.
+Unrelated triggers, existing daily report timing, and notification history stay
+intact. The current invocation still makes a bridging check of each city.
+
+Verify later `SUCCESS` rows say `Independent timer: checkEdmonton`,
+`checkNorthYork`, or `checkMontreal` in Details. Confirm one timer per city,
+one 15-minute health timer and one daily report timer. They may run at different
+minutes; each city still requests a five-minute interval. No new authorization
+scopes, public web app, or second project are required.
+
+Each city has a durable run record. A shared lock is held only while changing
+that record, never across website, email, watchdog or spreadsheet requests.
+An overlapping check for the same city is skipped; other cities can continue.
+An abandoned lease is reclaimed only after seven minutes, beyond Google's
+current six-minute execution limit. Independent timers prevent an individual
+provider stall from blocking the other cities in the same execution; they do
+not isolate Google's shared quotas or protect against account-wide outages.
 
 ### Added Provider Rules
 
@@ -66,8 +96,8 @@ and `Montreal` sheets use the same log format and retention as Edmonton's `Check
   pages, schema changes and network failures are explicit errors, not sold-out
   results. Each city's state, deduplication and success heartbeat are independent.
 - Requests have count and between-request time limits. North York detail/status
-  requests are batched in groups of eight. Shared execution checks Edmonton first
-  to protect the established home monitor if a new provider stalls.
+  requests are batched in groups of eight. Each scheduled city has its own
+  execution. The manual combined check still visits Edmonton first.
 
 HTTP 202 is not a validated catalog and never means zero seats. Non-200 or invalid
 JSON responses now log their media type, body character count, recognized challenge
@@ -86,7 +116,8 @@ change triggers, availability rules, deduplication or warning thresholds.
 ### Shared Free-Account Budget
 
 All three cities share Google's account-wide quotas. The 18.75-second average
-budget below applies to the **combined** five-minute run, not to each city.
+budget below applies to the **sum of all city executions per five minutes**, not
+to each city. Health audits and daily reports also consume this shared budget.
 Runtime warnings start at 20 measured minutes/day for a city or 60 combined.
 These are early-warning budgets, not Google's quota limits. They use explicitly
 labeled runtime-advisory emails, separate from website/check-failure warnings.
@@ -228,10 +259,26 @@ schedule as JSON**, including each row's reason for rejection.
 
 `SUCCESS` means the observation, alert handling, and notification state were
 completed. `FAILED` means monitoring encountered a problem, not that all seats
-are full. `OBSERVED` means a snapshot was written but final completion was not
-confirmed in that row; inspect subsequent rows and execution logs. An execution
-terminated by Google can leave only an execution error, without a spreadsheet
-row. External supervision is what catches this lack of success.
+are full. `OBSERVED` means a snapshot was written but its final log update is
+not yet confirmed. The health audit marks abandoned observations `INCOMPLETE`;
+this means completion is unknown, not zero availability. Original snapshots,
+seat-alert counts and successful-observation history are retained. A missing
+final log update can coexist with a committed observation or accepted heartbeat.
+
+The journal also detects terminated runs that never produced a spreadsheet row.
+Health reports show active/overdue runs, last finalization and detected incomplete
+runs separately from normal check failures. Incomplete runtime remains a lower
+bound; the audit never invents a completion time or sends old seat alerts again.
+One initial scan of the latest 1,000 rows per city reconciles legacy `OBSERVED`
+records (recent observations are deferred and revisited). Up to 20 interruptions
+from the last seven days are retained; truncation is explicitly shown in reports.
+An unfinished-run warning is sent once for newly detected evidence, subject to
+its own six-hour cooldown. A separate coverage warning checks missing/duplicate
+city timers and a successful-observation gap over 15 minutes.
+
+Health audits run on Google too. They cannot report a total Google/account outage;
+the external watchdog remains necessary. They do not fetch provider pages,
+alter notification state or send success pings.
 
 Watchdog delivery is recorded separately from seat-check success. A fast
 transport error or HTTP 408/500/502/503/504 receives **one retry**, only if the
@@ -252,8 +299,8 @@ Each city's logs and daily report include attempts, sanitized error/status,
 consecutive failures, last accepted delivery, last failure, and recovery time.
 Earlier versions did not retain the delivery error, so old failures cannot be
 retrospectively attributed to a specific network or HTTP problem. Health emails
-are throttled to one per six hours **per city and warning type** (site health or
-watchdog delivery), with five email-recipient slots reserved for availability
+are throttled to one per six hours **per city and warning type** (site health,
+watchdog delivery, unfinished runs, coverage or runtime), with five email-recipient slots reserved for availability
 alerts. Google's own trigger-failure notifications may still arrive.
 
 Before any replacement of the existing Edmonton monitor, review at least 24-48
@@ -275,8 +322,9 @@ are intentionally not provided as an installation control in this pilot.
 
 Google does not promise exact scheduling. Personal accounts currently allow
 90 minutes/day of trigger runtime, 20,000 URL fetches/day, and 100 email recipients
-per day across their scripts. At five-minute intervals, the average run must be
-below 18.75 seconds even before other scripts use quota. These quotas can change.
+per day across their scripts. At five-minute intervals, the sum of average city
+execution times must be below 18.75 seconds even before health audits, reports
+and other scripts use quota. These quotas can change.
 
 The runtime report is a local estimate measured around each check, not Google's
 quota meter. Startup, state saving, watchdog calls, reports, and hard-terminated
@@ -325,8 +373,10 @@ pnpm dlx @google/clasp open-script
 Rebuilding after project creation restores the intended manifest and minimum
 runtime scopes. For an existing linked project, rebuild and push without creating
 another project. `--force` accepts the manifest update; verify `.clasp.json`
-points to the intended pilot before using it. Run `installPilot` in the editor
-after uploading. Upload alone never starts a schedule.
+points to the intended pilot before using it. For a new project run `installPilot`
+or `installAllCities` in the editor after uploading; upload alone never starts a
+new schedule. An existing three-city timer automatically migrates as described
+above. No notification-state reset is required.
 
 Clasp credentials remain in the user's home directory. `.clasprc.json`, local
 project bindings, and local deployment metadata are excluded from Git. The
