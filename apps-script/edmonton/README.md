@@ -74,6 +74,11 @@ scopes, public web app, or second project are required.
 Each city has a durable run record. A shared lock is held only while changing
 that record, never across website, email, watchdog or spreadsheet requests.
 An overlapping check for the same city is skipped; other cities can continue.
+Completion recording retries lock acquisition up to three times, waiting at
+most five seconds per attempt. This applies to both checks and health audits,
+so brief contention does not leave an otherwise finished run blocking the next
+timer. Exhausted retries remain explicit warnings; no lease is forcibly cleared
+and the current owner is rechecked under the lock before every update.
 An abandoned lease is reclaimed only after seven minutes, beyond Google's
 current six-minute execution limit. Independent timers prevent an individual
 provider stall from blocking the other cities in the same execution; they do
@@ -85,6 +90,12 @@ not isolate Google's shared quotas or protect against account-wide outages.
   sub-courses, excluding preparation courses and other campuses. Pagination is
   sent in the HTTP `page_info` header, and returned page identity/counts must
   match. Parent location or parent enrollment links are not availability evidence.
+  Explicit parent listings are expanded even when their listed child count is
+  zero; the child endpoint must confirm that count. They are never treated as
+  directly bookable leaf courses. Street-only campus labels are matched against
+  the [official campus directory](https://www.alliance-francaise.ca/en/who/contact-us),
+  including Sherwoodtowne Boulevard (Mississauga) and Sheppard East (North York).
+  Unrecognized or conflicting locations still fail explicitly.
   Require a North York leaf-course detail and its final matching **Enroll Now**
   action; reject hold, full, waitlist, countdown, disabled and closed states.
   Recheck previously open future courses even when the catalogue hides them.

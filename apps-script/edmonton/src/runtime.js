@@ -19,6 +19,12 @@ const runs = createRunJournal({ properties, key: key("RUN_JOURNAL"),
 function properties() { return PropertiesService.getScriptProperties(); }
 function recentChecks(checks) { return checks.filter(check => check.at >= Date.now() - 86400000).slice(-650); }
 
+function finishRun(run, outcome) {
+  try {
+    if (runs.finish(run, outcome).busy) console.warn("Run completion could not be recorded after bounded retries; health audit will report it as unknown.");
+  } catch (error) { console.error(`Run completion could not be recorded: ${safeError(error)}`); }
+}
+
 function config() {
   if (activeConfig) return activeConfig;
   const p = properties();
@@ -247,9 +253,7 @@ function runCheck(dryRun, event) {
     throw new Error(message);
   } finally {
     activeConfig = null;
-    try {
-      if (runs.finish(run, finishOutcome).busy) console.warn("Run completion could not be recorded; health audit will report it as unknown.");
-    } catch (error) { console.error(`Run completion could not be recorded: ${safeError(error)}`); }
+    finishRun(run, finishOutcome);
   }
 }
 
@@ -305,7 +309,7 @@ function auditRuns() {
     }
     outcome = "AUDITED";
     return { outcome, incompleteRunsRetained: journal.interruptions.length };
-  } finally { runs.finish(claim.run, outcome); }
+  } finally { finishRun(claim.run, outcome); }
 }
 
 function check(event) { return runCheck(false, event); }

@@ -15,9 +15,9 @@ export function createRunJournal({ properties, key, lock, now = Date.now, uuid }
     }
     return journal;
   }
-  function change(fn) {
+  function change(fn, waitMs = 1000) {
     const guard = lock();
-    if (!guard.tryLock(1000)) return { busy: true };
+    if (!guard.tryLock(waitMs)) return { busy: true };
     try {
       const journal = read();
       const result = fn(journal);
@@ -62,13 +62,19 @@ export function createRunJournal({ properties, key, lock, now = Date.now, uuid }
       if (result.busy) throw new Error("Could not save the run observation checkpoint.");
     },
     finish(run, outcome) {
-      return change(journal => {
-        if (journal.current?.id !== run.id) return { write: false };
-        if (outcome === "INCOMPLETE") interrupt(journal, journal.current);
-        journal.lastFinished = { at: now(), outcome, started: run.started, kind: run.kind };
-        journal.current = null;
-        return { finished: true };
-      });
+      // A short collision must not leave a finished run blocking the next timer.
+      // Retry acquisition only; storage failures stay explicit, and ownership is rechecked.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const result = change(journal => {
+          if (journal.current?.id !== run.id) return { write: false };
+          if (outcome === "INCOMPLETE") interrupt(journal, journal.current);
+          journal.lastFinished = { at: now(), outcome, started: run.started, kind: run.kind };
+          journal.current = null;
+          return { finished: true };
+        }, 5000);
+        if (!result.busy) return result;
+      }
+      return { busy: true };
     },
     importLegacy(runs, complete = true) {
       return change(journal => {

@@ -70,8 +70,9 @@ function dayMonthYear(value) {
 
 export function northYorkLocation(value) {
   const text = clean(value);
-  const northYork = /\bnorth[\s-]*york\b|\bjim doak\b|\b47\s+sheppard\s+(?:avenue|ave\.?)\s+(?:east|e\b)/i.test(text);
-  const other = /\boakville\b|\bmississauga\b|\bspadina\b|\bmarkham\b/i.test(text);
+  // Address-only labels are used by ActiveNet; aliases come from AFT's campus directory.
+  const northYork = /\bnorth[\s-]*york\b|\bjim doak\b|\b47[\s,]+sheppard\s+(?:(?:avenue|ave\.?)\s+)?(?:east|e)\b/i.test(text);
+  const other = /\boakville\b|\bmississauga\b|\bspadina\b|\bmarkham\b|\b4261\s+sherwoodtowne\s+(?:boulevard|blvd)\b|\b7828\s+kennedy\s+(?:road|rd)\b|\b247\s+north\s+service\s+(?:road|rd)\.?\s+(?:west|w)\b/i.test(text);
   if (northYork && other) throw new Error("Conflicting North York campus identity.");
   if (northYork) return true;
   if (other) return false;
@@ -208,10 +209,12 @@ export function fetchNorthYork(request, { seen = {}, today, now = Date.now } = {
     if (page === parsed.pages) break;
   }
   // Parent location alone is not authoritative; children may use another campus.
-  const expandable = parents.filter(p => p.num_of_sub_activities > 0);
+  // A parent stays a parent when all its currently listed children disappear.
+  const isParent = p => p.parent_activity === true || p.num_of_sub_activities > 0;
+  const expandable = parents.filter(isParent);
   const children = http.many(expandable.map(p => ({ url: `${ACTIVE_BASE}/rest/activities/subs/${p.id}`,
     options: { method: "post", contentType: "application/json", payload: "{}", headers } })));
-  const leaves = parents.filter(p => !p.num_of_sub_activities);
+  const leaves = parents.filter(p => !isParent(p));
   children.forEach((response, i) => leaves.push(...parseActiveChildren(json(response, "North York sub-courses"), expandable[i])));
   const byId = new Map();
   for (const candidate of leaves) {

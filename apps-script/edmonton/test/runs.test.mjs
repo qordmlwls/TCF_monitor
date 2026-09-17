@@ -5,9 +5,14 @@ import { Properties } from "./fixtures.mjs";
 
 function fixture() {
   const p = new Properties();
-  const env = { now: Date.parse("2026-09-14T00:00:00Z"), held: false, count: 0 };
+  const env = { now: Date.parse("2026-09-14T00:00:00Z"), held: false, count: 0, deniedLocks: 0, waits: [] };
   const options = { properties: () => p, now: () => env.now, uuid: () => `run-${++env.count}`,
-    lock: () => ({ tryLock() { if (env.held) return false; env.held = true; return true; }, releaseLock() { env.held = false; } }) };
+    lock: () => ({ tryLock(ms) {
+      env.waits.push(ms);
+      if (env.deniedLocks > 0) { env.deniedLocks--; return false; }
+      if (env.held) return false;
+      env.held = true; return true;
+    }, releaseLock() { env.held = false; } }) };
   return { p, env, journal: createRunJournal({ ...options, key: "city1" }), other: createRunJournal({ ...options, key: "city2" }) };
 }
 
@@ -95,4 +100,31 @@ test("lock contention does not mutate a journal and a checkpoint failure is expl
   assert.throws(() => journal.observed(run, 3, "now"), /checkpoint/);
   assert.equal(journal.finish(run, "SUCCESS").busy, true);
   assert.equal(p.getProperty("city1"), before);
+});
+
+for (const outcome of ["SUCCESS", "FAILED", "AUDITED"]) {
+  test(`temporary completion contention cannot block the next check after ${outcome}`, () => {
+    const { journal, env } = fixture();
+    const run = journal.begin(outcome === "AUDITED" ? "AUDIT" : "CHECK").run;
+    env.deniedLocks = 2; env.waits = [];
+    assert.equal(journal.finish(run, outcome).finished, true);
+    assert.deepEqual(env.waits, [5000, 5000, 5000]);
+    assert.equal(journal.read().current, null);
+    assert.equal(journal.read().lastFinished.outcome, outcome);
+    env.now += 5 * 60000;
+    assert.ok(journal.begin().run);
+    assert.equal(journal.read().interruptions.length, 0);
+  });
+}
+
+test("exhausted completion contention is bounded and never unlocks another owner", () => {
+  const { journal, env, p } = fixture();
+  const run = journal.begin().run, before = p.getProperty("city1");
+  env.held = true; env.waits = [];
+  assert.equal(journal.finish(run, "SUCCESS").busy, true);
+  assert.deepEqual(env.waits, [5000, 5000, 5000]);
+  assert.equal(env.held, true);
+  assert.equal(p.getProperty("city1"), before);
+  env.held = false;
+  assert.equal(journal.finish(run, "SUCCESS").finished, true);
 });

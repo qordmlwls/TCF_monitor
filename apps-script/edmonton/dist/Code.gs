@@ -3488,8 +3488,8 @@ var EdmontonMonitor = (() => {
   }
   function northYorkLocation(value) {
     const text = clean(value);
-    const northYork2 = /\bnorth[\s-]*york\b|\bjim doak\b|\b47\s+sheppard\s+(?:avenue|ave\.?)\s+(?:east|e\b)/i.test(text);
-    const other = /\boakville\b|\bmississauga\b|\bspadina\b|\bmarkham\b/i.test(text);
+    const northYork2 = /\bnorth[\s-]*york\b|\bjim doak\b|\b47[\s,]+sheppard\s+(?:(?:avenue|ave\.?)\s+)?(?:east|e)\b/i.test(text);
+    const other = /\boakville\b|\bmississauga\b|\bspadina\b|\bmarkham\b|\b4261\s+sherwoodtowne\s+(?:boulevard|blvd)\b|\b7828\s+kennedy\s+(?:road|rd)\b|\b247\s+north\s+service\s+(?:road|rd)\.?\s+(?:west|w)\b/i.test(text);
     if (northYork2 && other) throw new Error("Conflicting North York campus identity.");
     if (northYork2) return true;
     if (other) return false;
@@ -3640,12 +3640,13 @@ var EdmontonMonitor = (() => {
       parents.push(...parsed.candidates);
       if (page === parsed.pages) break;
     }
-    const expandable = parents.filter((p) => p.num_of_sub_activities > 0);
+    const isParent = (p) => p.parent_activity === true || p.num_of_sub_activities > 0;
+    const expandable = parents.filter(isParent);
     const children = http.many(expandable.map((p) => ({
       url: `${ACTIVE_BASE}/rest/activities/subs/${p.id}`,
       options: { method: "post", contentType: "application/json", payload: "{}", headers }
     })));
-    const leaves = parents.filter((p) => !p.num_of_sub_activities);
+    const leaves = parents.filter((p) => !isParent(p));
     children.forEach((response, i) => leaves.push(...parseActiveChildren(json(response, "North York sub-courses"), expandable[i])));
     const byId = /* @__PURE__ */ new Map();
     for (const candidate of leaves) {
@@ -3915,9 +3916,9 @@ var EdmontonMonitor = (() => {
       }
       return journal;
     }
-    function change(fn) {
+    function change(fn, waitMs = 1e3) {
       const guard = lock();
-      if (!guard.tryLock(1e3)) return { busy: true };
+      if (!guard.tryLock(waitMs)) return { busy: true };
       try {
         const journal = read();
         const result = fn(journal);
@@ -3970,13 +3971,17 @@ var EdmontonMonitor = (() => {
         if (result.busy) throw new Error("Could not save the run observation checkpoint.");
       },
       finish(run, outcome) {
-        return change((journal) => {
-          if (journal.current?.id !== run.id) return { write: false };
-          if (outcome === "INCOMPLETE") interrupt(journal, journal.current);
-          journal.lastFinished = { at: now(), outcome, started: run.started, kind: run.kind };
-          journal.current = null;
-          return { finished: true };
-        });
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const result = change((journal) => {
+            if (journal.current?.id !== run.id) return { write: false };
+            if (outcome === "INCOMPLETE") interrupt(journal, journal.current);
+            journal.lastFinished = { at: now(), outcome, started: run.started, kind: run.kind };
+            journal.current = null;
+            return { finished: true };
+          }, 5e3);
+          if (!result.busy) return result;
+        }
+        return { busy: true };
       },
       importLegacy(runs, complete = true) {
         return change((journal) => {
@@ -4029,6 +4034,13 @@ var EdmontonMonitor = (() => {
     }
     function recentChecks(checks) {
       return checks.filter((check2) => check2.at >= Date.now() - 864e5).slice(-650);
+    }
+    function finishRun(run, outcome) {
+      try {
+        if (runs.finish(run, outcome).busy) console.warn("Run completion could not be recorded after bounded retries; health audit will report it as unknown.");
+      } catch (error) {
+        console.error(`Run completion could not be recorded: ${safeError(error)}`);
+      }
     }
     function config() {
       if (activeConfig) return activeConfig;
@@ -4319,11 +4331,7 @@ This threshold is our early-warning budget, not Google's account-wide quota limi
         throw new Error(message);
       } finally {
         activeConfig = null;
-        try {
-          if (runs.finish(run, finishOutcome).busy) console.warn("Run completion could not be recorded; health audit will report it as unknown.");
-        } catch (error) {
-          console.error(`Run completion could not be recorded: ${safeError(error)}`);
-        }
+        finishRun(run, finishOutcome);
       }
     }
     function auditRuns() {
@@ -4375,7 +4383,7 @@ This threshold is our early-warning budget, not Google's account-wide quota limi
         outcome = "AUDITED";
         return { outcome, incompleteRunsRetained: journal.interruptions.length };
       } finally {
-        runs.finish(claim.run, outcome);
+        finishRun(claim.run, outcome);
       }
     }
     function check(event) {

@@ -13,6 +13,47 @@ test("North York campus is explicit and distinguishes all other Toronto campuses
   assert.equal(northYorkLocation("Toronto"), null);
   assert.throws(() => northYorkLocation("North York / Oakville"), /Conflicting/);
 });
+test("official street-only campus addresses are recognized without guessing unknown venues", () => {
+  for (const address of ["47, Sheppard E. Unit 502, 5th floor", "47 Sheppard Ave East", "47 Sheppard Avenue E."]) {
+    assert.equal(northYorkLocation(address), true, address);
+  }
+  for (const address of ["4261 Sherwoodtowne blvd", "4261 Sherwoodtowne Boulevard", "7828 Kennedy Road, Suite 228",
+    "247 North Service Rd. W. #303", "247 North Service Road West", "24 Spadina Road"]) {
+    assert.equal(northYorkLocation(address), false, address);
+  }
+  for (const address of ["Toronto", "Sherwoodtowne blvd", "4262 Sherwoodtowne blvd", "147 Sheppard E", "47 Sheppard West"]) {
+    assert.equal(northYorkLocation(address), null, address);
+  }
+  assert.throws(() => northYorkLocation("North York / 4261 Sherwoodtowne blvd"), /Conflicting/);
+});
+test("September 15 Mississauga street-only leaf cannot block or alert as North York", () => {
+  const other = candidate({ id: 125169, location: { label: "4261 Sherwoodtowne blvd" } });
+  assert.equal(parseNorthYorkCourse(other, detail({ activity_id: 125169, location_description: other.location.label }), button(), today), null);
+  const paths = [];
+  const result = fetchNorthYork(url => {
+    paths.push(url);
+    if (url.endsWith("/list")) return response(search([other, candidate()]));
+    assert.ok(!url.includes("125169"));
+    return response(url.includes("buttonstatus") ? button() : detail());
+  }, { today });
+  assert.deepEqual(result.rows.map(row => row.sourceId), [123]);
+  assert.equal(result.rows[0].available, true);
+  assert.equal(paths.length, 3);
+});
+test("September 17 parent with zero listed sub-courses is expanded, never treated as a leaf", () => {
+  const parent = candidate({ id: 125170, parent_activity: true, num_of_sub_activities: 0 });
+  const paths = [];
+  const request = url => {
+    paths.push(url);
+    if (url.endsWith("/list")) return response(search([parent]));
+    if (url.endsWith("/subs/125170")) return response(active({ sub_activities: [] }));
+    throw new Error("An empty parent must not be checked as a bookable leaf");
+  };
+  assert.deepEqual(fetchNorthYork(request, { today }).rows, []);
+  assert.equal(paths.length, 2);
+  assert.throws(() => fetchNorthYork(url => url.includes("/subs/")
+    ? response(active({ sub_activities: [candidate()] })) : request(url), { today }), /incomplete/);
+});
 test("North York accepts only a future four-module leaf and final matching Enroll Now action", () => {
   const row = parseNorthYorkCourse(candidate(), detail(), button(), today);
   assert.equal(row.available, true);

@@ -42,7 +42,8 @@ function runtime() {
     Date: Clock,
     console: { log: (...args) => messages.push(args.join(" ")), warn: (...args) => messages.push(args.join(" ")), error: (...args) => messages.push(args.join(" ")) },
     PropertiesService: { getScriptProperties: () => p },
-    LockService: { getScriptLock: () => ({ tryLock: () => {
+    LockService: { getScriptLock: () => ({ tryLock: ms => {
+      if (ms === 5000 && env.deniedCompletionLocks > 0) { env.deniedCompletionLocks--; return false; }
       if (env.locked || env.lockHeld) return false;
       env.lockHeld = true; return true;
     }, releaseLock: () => { env.lockHeld = false; env.released += 1; } }) },
@@ -115,6 +116,37 @@ function seedUnfinished(r, { age = 8 * 60000, withRow = true, legacy = false } =
   if (!legacy) r.p.setProperty("TCF_RUN_JOURNAL", JSON.stringify({ version: 1, current: run, interruptions: [] }));
   return run;
 }
+
+test("failed city checks and audits finalize after temporary contention without false unfinished warnings", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  r.env.providerRoute = url => url.includes("/rest/activities/list")
+    ? { status: 503, body: "unavailable" } : providerRoute(url);
+  r.env.deniedCompletionLocks = 2;
+  assert.throws(() => r.sandbox.checkNorthYork(), /503/);
+  assert.equal(JSON.parse(r.p.getProperty("TCF_NORTH_YORK_RUN_JOURNAL")).current, null);
+  r.env.deniedCompletionLocks = 2;
+  r.sandbox.checkMonitorHealth();
+  assert.equal(JSON.parse(r.p.getProperty("TCF_NORTH_YORK_RUN_JOURNAL")).current, null);
+  r.env.now += 5 * 60000;
+  r.env.providerRoute = providerRoute;
+  assert.equal(r.sandbox.checkNorthYork().outcome, "SUCCESS");
+  assert.equal(JSON.parse(r.p.getProperty("TCF_NORTH_YORK_RUN_JOURNAL")).interruptions.length, 0);
+  assert.ok(!r.messages.some(message => /completion could not|Skipped overlapping/.test(message)));
+});
+
+test("exhausted completion retries remain visible without hiding the original provider error", () => {
+  const r = multiRuntime(); r.sandbox.dryRunAllCities();
+  r.env.providerRoute = url => url.includes("/rest/activities/list")
+    ? { status: 503, body: "unavailable" } : providerRoute(url);
+  r.env.deniedCompletionLocks = 3;
+  assert.throws(() => r.sandbox.checkNorthYork(), /503/);
+  assert.ok(r.messages.some(message => /completion could not be recorded after bounded retries/.test(message)));
+  assert.ok(JSON.parse(r.p.getProperty("TCF_NORTH_YORK_RUN_JOURNAL")).current);
+  assert.equal(r.sandbox.checkNorthYork().outcome, "SKIPPED_OVERLAP");
+  r.env.now += 8 * 60000; r.env.providerRoute = providerRoute;
+  assert.equal(r.sandbox.checkNorthYork().outcome, "SUCCESS");
+  assert.equal(JSON.parse(r.p.getProperty("TCF_NORTH_YORK_RUN_JOURNAL")).interruptions.length, 1);
+});
 
 test("a fetching Edmonton check neither holds the shared lock nor prevents other cities from running", () => {
   const r = multiRuntime(); r.sandbox.dryRunAllCities();
